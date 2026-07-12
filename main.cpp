@@ -1,8 +1,10 @@
-//PulsarGG v1.0.1 (c) GGee64
+//soluGGix v1.0.5 (c) GGee64
 
 #define INITGUID
 #include <windows.h>
 #include <d2d1.h>
+#include "daycycle.h"
+#include "calendar.h"
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 #include <shellapi.h>
@@ -18,6 +20,7 @@
 #include <mmsystem.h>
 #include <cstring>
 #include <cstdint>
+#include "resource.h"
 
 #ifndef AUDCLNT_BUFFERFLAGS_SILENT
 #define AUDCLNT_BUFFERFLAGS_SILENT 0x8
@@ -44,19 +47,30 @@ HWND hMainWnd = nullptr;
 HWND hOverlayWnd = nullptr;
 NOTIFYICONDATA nid = {};
 std::atomic<bool> g_running = true;
-int screenWidth = 0, screenHeight = 0;
 HICON hTrayIcon = nullptr;
 std::thread* pAnimThread = nullptr;
 std::condition_variable g_cv;
 std::mutex g_cv_m;
 std::atomic<bool> g_deviceChanged{ false };
 std::atomic<bool> g_streamInvalidated{ false }; // Для AUDCLNT_E_DEVICE_INVALIDATED
+std::atomic<bool> g_overlayActive = false;
+int screenWidth = 0, screenHeight = 0;
+
+static UINT GetSystemRefreshRate() {
+    DEVMODE dm = {};
+    dm.dmSize = sizeof(DEVMODE);
+    if (EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &dm)) {
+        return (dm.dmDisplayFrequency > 0) ? dm.dmDisplayFrequency : 60;
+    }
+    return 60; // fallback на случай ошибки API
+}
 
 struct OverlayState {
     ID2D1Factory* factory = nullptr;
     ID2D1HwndRenderTarget* rt = nullptr;
     ID2D1SolidColorBrush* brushes[64] = {};
     bool ready = false;
+    DayCycleState dc;
 };
 
 struct Band {
@@ -387,7 +401,7 @@ public:
 
         // Ниже порога аппаратного шума → это тишина. Масштаб = 0 (убивает ложный пульс на 0% и дребезг волн)
         const double SILENCE_FLOOR = 0.002;
-        float frameScale = (maxInFrame < SILENCE_FLOOR) ? 0.0f : (0.45f / static_cast<float>(maxInFrame));
+        float frameScale = (maxInFrame < SILENCE_FLOOR) ? 0.0f : (0.25f / static_cast<float>(maxInFrame));
 
         // ВАЖНО: ReleaseBuffer вызывается ровно один раз после GetBuffer (по spec WASAPI)
         pCaptureClient->ReleaseBuffer(numFrames);
@@ -444,8 +458,13 @@ void GetScreenSize() { screenWidth = GetSystemMetrics(SM_CXSCREEN); screenHeight
 
 void DrawEqualizer(ID2D1HwndRenderTarget* rt, const OverlayState* state) {
     if (!rt || !state->ready) return;
+
     rt->BeginDraw();
     rt->Clear(D2D1::ColorF(0.0f, 0.0f, 0.0f));
+
+    // ✅ ВЫЗОВ ЦИКЛА ДНЯ/НОЧИ (рисует фоны и светила до полос эквалайзера)
+    RenderDayCycle(rt, screenWidth, screenHeight, state->dc);
+    Cal::RenderCalendar(rt, (float)screenWidth, (float)screenHeight);
 
     Band data[64]; for (int e = 0; e < 64; ++e) data[e] = g_audio.GetBand(e);
     const int NUM_BANDS = 64;
@@ -524,10 +543,11 @@ void DrawEqualizer(ID2D1HwndRenderTarget* rt, const OverlayState* state) {
         rt->FillRectangle(D2D1::RectF(screenWidth - marginX - w, i * (barH + gapY), screenWidth - marginX, i * (barH + gapY) + barH), state->brushes[bIdx]);
     }
 
+    rt->Flush();
+
     HRESULT hr = rt->EndDraw();
     if (FAILED(hr)) return;
 }
-
 
 LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static OverlayState* state = nullptr;
@@ -536,26 +556,53 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         state = new OverlayState(); ZeroMemory(state, sizeof(OverlayState));
         if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &state->factory))) return -1;
 
-        RECT rc = { 0 }; GetWindowRect(hwnd, &rc);
-        int w = rc.right - rc.left, h = rc.bottom - rc.top;
+        // ✅ КРИТИЧНО ДЛЯ LAYERED ОКОН: даем системе инициализировать DC перед D2D
+        ShowWindow(hwnd, SW_SHOWNA);
+        UpdateWindow(hwnd);
 
-        if (FAILED(state->factory->CreateHwndRenderTarget(
-            D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT,
-                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED)),
-            D2D1::HwndRenderTargetProperties(hwnd, D2D1::SizeU(w, h)), &state->rt)) || !state->rt) {
-            MessageBox(NULL, L"D2D Init Fail", L"Error", MB_ICONERROR); return -1;
+        RECT rc = { 0 }; GetClientRect(hwnd, &rc);
+        int w = rc.right - rc.left, h = rc.bottom - rc.top;
+        if (w <= 0) w = screenWidth;
+        if (h <= 0) h = screenHeight;
+        if (w < 1) w = 1;
+        if (h < 1) h = 1;
+
+        // ✅ ЯВНОЕ ОБНУЛЕНИЕ ДО СОЗДАНИЯ (COM НЕ ИНИЦИАЛИЗИРУЕТ OUT-ПАРАМЕТРЫ ПРИ ОШИБКЕ)
+        state->rt = nullptr;
+        HRESULT hr = state->factory->CreateHwndRenderTarget(
+            D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE)),
+            D2D1::HwndRenderTargetProperties(hwnd, D2D1::SizeU(w, h)), &state->rt);
+
+        if (FAILED(hr) || !state->rt) {
+            state->rt = nullptr;
+        }
+        else {
+            // ✅ ИСПРАВЛЕНО: GetSize() возвращает структуру напрямую
+            D2D1_SIZE_F testSize = state->rt->GetSize();
+            if (testSize.width <= 0.0f || testSize.height <= 0.0f) {
+                state->rt->Release();
+                state->rt = nullptr;
+            }
         }
 
         const int NUM_BANDS = 64;
         for (int i = 0; i < NUM_BANDS; ++i) {
             float t = static_cast<float>(i) / (NUM_BANDS - 1);
             D2D1::ColorF c(0.4f + t * 0.6f, 0.9f - t * 0.3f, 1.0f, 1.0f);
-            state->rt->CreateSolidColorBrush(c, &state->brushes[i]);
+            if (state->rt) state->rt->CreateSolidColorBrush(c, &state->brushes[i]);
         }
+
+        if (state->rt) InitDayCycle(state->rt, &state->dc);
+        else state->dc.initialized = false;
+
         state->ready = true;
+        g_overlayActive.store(true);
         SetPropW(hwnd, L"OverlayState", reinterpret_cast<HANDLE>(state));
-        SetTimer(hwnd, 1, 1000 / 75, NULL);
-        return 0;
+        UINT refresh = GetSystemRefreshRate();
+        SetTimer(hwnd, 1, refresh > 0 ? 1000 / refresh : 16, NULL);\
+        
+            return 0;
     }
     case WM_TIMER: {
         OverlayState* s = reinterpret_cast<OverlayState*>(GetPropW(hwnd, L"OverlayState"));
@@ -565,15 +612,25 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_SIZE: {
         OverlayState* s = reinterpret_cast<OverlayState*>(GetPropW(hwnd, L"OverlayState"));
         if (!s || !s->rt) return 0;
-        RECT rc = { 0 }; GetWindowRect(hwnd, &rc);
-        s->rt->Resize(D2D1::SizeU(rc.right - rc.left, rc.bottom - rc.top));
+
+        // ✅ Д2Д НЕ ПРИНИМАЕТ РАЗМЕР 0x0 НА СЛОЕННЫХ ОКНАХ → ВЫЗЫВАЕТ КРАШ
+        int w = LOWORD(lParam);
+        int h = HIWORD(lParam);
+        if (w <= 0 || h <= 0) return 0;
+
+        s->rt->Resize(D2D1::SizeU(w, h));
         InvalidateRect(hwnd, NULL, TRUE);
         return 0;
     }
     case WM_DESTROY: {
+        // ✅ УБИВАЕМ ТАЙМЕР ДО ОЧИСТКИ ПАМЯТИ (устраняет use-after-free)
+        g_overlayActive.store(false);
+        KillTimer(hwnd, 1);
+
         OverlayState* s = reinterpret_cast<OverlayState*>(GetPropW(hwnd, L"OverlayState"));
-        RemovePropW(hwnd, L"OverlayState");
         if (s) {
+            RemovePropW(hwnd, L"OverlayState");
+            ShutdownDayCycle(s->dc);
             for (int i = 0; i < 64; ++i) if (s->brushes[i]) s->brushes[i]->Release();
             if (s->rt) s->rt->Release();
             if (s->factory) s->factory->Release();
@@ -629,8 +686,8 @@ bool WaitForValidAudio(AudioCapture* audio, std::chrono::milliseconds timeout) {
 
 void AnimationThread() {
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    Cal::InitCalendarModule();
     g_audio.Start();
-
     auto lastTime = std::chrono::steady_clock::now();
     constexpr double targetDelta = 1000.0 / 75.0;
     double accumulator = 0.0f;
@@ -685,6 +742,7 @@ void ShowTrayMenu() {
 }
 
 void CleanupAndExit(HWND hwnd) {
+    Cal::ShutdownCalendarModule();
     g_running = false;
     g_cv.notify_all();
 
@@ -738,8 +796,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int) {
     WNDCLASS ov = { 0 }; ov.lpfnWndProc = OverlayWndProc; ov.hInstance = hInst; ov.lpszClassName = L"PulseOverlay";
     ov.hbrBackground = (HBRUSH)GetStockObject(NULL_BRUSH); ov.hCursor = LoadCursor(NULL, IDC_ARROW); RegisterClass(&ov);
 
-    hOverlayWnd = CreateWindowEx(WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW,
-        L"PulseOverlay", L"", WS_POPUP, 0, 0, screenWidth, screenHeight, NULL, NULL, hInst, NULL);
+    // ✅ ДОБАВЛЕН ФЛАГ WS_EX_NOACTIVATE СЮДА:
+    // Теперь окно оверлея не будет перекрывать уведомления Discord и системы
+    hOverlayWnd = CreateWindowEx(WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        L"PulseOverlay", L"", WS_POPUP,
+        0, 1, screenWidth, screenHeight - 1, // Смещаем по Y на 1, высоту уменьшаем на 1
+        GetShellWindow(), NULL, hInst, NULL);
+
     if (!hOverlayWnd) return -1;
 
     SetPropW(hOverlayWnd, L"NonRudeHWND", reinterpret_cast<HANDLE>(TRUE));
