@@ -552,6 +552,27 @@ void DrawEqualizer(ID2D1HwndRenderTarget* rt, const OverlayState* state) {
 LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static OverlayState* state = nullptr;
     switch (msg) {
+        // ✅ ЗАЩИТА ОТ СКРЫТИЯ И ПОТЕРИ TOPMOST-СТАТУСА (Win+D, Explorer, Shell, Утилиты)
+    case WM_SYSCOMMAND:
+        // Блокируем сворачивание, закрытие, максимизацию из системного меню и горячих клавиш
+        if (wParam == SC_MINIMIZE || wParam == SC_CLOSE || wParam == SC_MAXIMIZE) return 0;
+        break;
+
+    case WM_WINDOWPOSCHANGING: {
+        // Перехватываем изменения размеров/позиции до их применения. Блокируем скрытие на уровне ОС.
+        WINDOWPOS* wp = reinterpret_cast<WINDOWPOS*>(lParam);
+        if (wp && (wp->flags & SWP_HIDEWINDOW)) return 0;
+        break;
+    }
+
+    case WM_SHOWWINDOW:
+        // Фоллбэк для случаев, когда shell применяет скрытие напрямую через API (Win+D)
+        if (wParam == FALSE) {
+            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            return 0;
+        }
+        break;
+
     case WM_CREATE: {
         state = new OverlayState(); ZeroMemory(state, sizeof(OverlayState));
         if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &state->factory))) return -1;
@@ -599,16 +620,28 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         state->ready = true;
         g_overlayActive.store(true);
         SetPropW(hwnd, L"OverlayState", reinterpret_cast<HANDLE>(state));
+
         UINT refresh = GetSystemRefreshRate();
-        SetTimer(hwnd, 1, refresh > 0 ? 1000 / refresh : 16, NULL);\
-        
-            return 0;
-    }
-    case WM_TIMER: {
-        OverlayState* s = reinterpret_cast<OverlayState*>(GetPropW(hwnd, L"OverlayState"));
-        if (s && s->ready && s->rt) DrawEqualizer(s->rt, s);
+        SetTimer(hwnd, 1, refresh > 0 ? 1000 / refresh : 16, NULL); // Таймер рендера
+        SetTimer(hwnd, 2, 1000, NULL); // ✅ НОВЫЙ: Таймер принудительного удержания TOPMOST (каждые 1000мс)
+
         return 0;
     }
+
+    case WM_TIMER: {
+        if (wParam == 1) { // Рендер эквалайзера
+            OverlayState* s = reinterpret_cast<OverlayState*>(GetPropW(hwnd, L"OverlayState"));
+            if (s && s->ready && s->rt) DrawEqualizer(s->rt, s);
+        }
+        else if (wParam == 2) { // ✅ Удержание окна поверх всех окон (компенсирует Win+D и Shell)
+            if (hOverlayWnd && IsWindow(hOverlayWnd)) {
+                // SWP_NOACTIVATE предотвращает перехват фокуса другими окнами при возврате оверлея наверх
+                SetWindowPos(hOverlayWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+        }
+        return 0;
+    }
+
     case WM_SIZE: {
         OverlayState* s = reinterpret_cast<OverlayState*>(GetPropW(hwnd, L"OverlayState"));
         if (!s || !s->rt) return 0;
@@ -622,10 +655,12 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         InvalidateRect(hwnd, NULL, TRUE);
         return 0;
     }
+
     case WM_DESTROY: {
         // ✅ УБИВАЕМ ТАЙМЕР ДО ОЧИСТКИ ПАМЯТИ (устраняет use-after-free)
         g_overlayActive.store(false);
         KillTimer(hwnd, 1);
+        KillTimer(hwnd, 2); // ✅ Очищаем таймер TOPMOST
 
         OverlayState* s = reinterpret_cast<OverlayState*>(GetPropW(hwnd, L"OverlayState"));
         if (s) {
@@ -638,6 +673,7 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         return 0;
     }
+
     case WM_NCHITTEST: return HTTRANSPARENT;
     default: break;
     }
