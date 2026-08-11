@@ -552,21 +552,18 @@ void DrawEqualizer(ID2D1HwndRenderTarget* rt, const OverlayState* state) {
 LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static OverlayState* state = nullptr;
     switch (msg) {
-        // ✅ ЗАЩИТА ОТ СКРЫТИЯ И ПОТЕРИ TOPMOST-СТАТУСА (Win+D, Explorer, Shell, Утилиты)
+        // ✅ ЗАЩИТА ОТ СКРЫТИЯ И ПОТЕРИ TOPMOST-СТАТУСА (без изменений логики)
     case WM_SYSCOMMAND:
-        // Блокируем сворачивание, закрытие, максимизацию из системного меню и горячих клавиш
         if (wParam == SC_MINIMIZE || wParam == SC_CLOSE || wParam == SC_MAXIMIZE) return 0;
         break;
 
     case WM_WINDOWPOSCHANGING: {
-        // Перехватываем изменения размеров/позиции до их применения. Блокируем скрытие на уровне ОС.
         WINDOWPOS* wp = reinterpret_cast<WINDOWPOS*>(lParam);
         if (wp && (wp->flags & SWP_HIDEWINDOW)) return 0;
         break;
     }
 
     case WM_SHOWWINDOW:
-        // Фоллбэк для случаев, когда shell применяет скрытие напрямую через API (Win+D)
         if (wParam == FALSE) {
             SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             return 0;
@@ -577,29 +574,30 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         state = new OverlayState(); ZeroMemory(state, sizeof(OverlayState));
         if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &state->factory))) return -1;
 
-        // ✅ КРИТИЧНО ДЛЯ LAYERED ОКОН: даем системе инициализировать DC перед D2D
         ShowWindow(hwnd, SW_SHOWNA);
         UpdateWindow(hwnd);
 
         RECT rc = { 0 }; GetClientRect(hwnd, &rc);
-        int w = rc.right - rc.left, h = rc.bottom - rc.top;
-        if (w <= 0) w = screenWidth;
-        if (h <= 0) h = screenHeight;
-        if (w < 1) w = 1;
-        if (h < 1) h = 1;
+        int w = max(rc.right - rc.left, screenWidth) > 0 ? max(rc.right - rc.left, screenWidth) : 1;
+        int h = max(rc.bottom - rc.top, screenHeight) > 0 ? max(rc.bottom - rc.top, screenHeight) : 1;
 
-        // ✅ ЯВНОЕ ОБНУЛЕНИЕ ДО СОЗДАНИЯ (COM НЕ ИНИЦИАЛИЗИРУЕТ OUT-ПАРАМЕТРЫ ПРИ ОШИБКЕ)
         state->rt = nullptr;
+
+        // ✅ ОПТИМИЗАЦИЯ №1: DEFAULT вместо SOFTWARE. D2D автоматически выбирает GPU-ускорение на современных ОС.
         HRESULT hr = state->factory->CreateHwndRenderTarget(
-            D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+            D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT,
                 D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE)),
             D2D1::HwndRenderTargetProperties(hwnd, D2D1::SizeU(w, h)), &state->rt);
 
         if (FAILED(hr) || !state->rt) {
-            state->rt = nullptr;
+            // Fallback на software (крайне редко требуется)
+            hr = state->factory->CreateHwndRenderTarget(
+                D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+                    D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE)),
+                D2D1::HwndRenderTargetProperties(hwnd, D2D1::SizeU(w, h)), &state->rt);
+            if (FAILED(hr) || !state->rt) state->rt = nullptr;
         }
         else {
-            // ✅ ИСПРАВЛЕНО: GetSize() возвращает структуру напрямую
             D2D1_SIZE_F testSize = state->rt->GetSize();
             if (testSize.width <= 0.0f || testSize.height <= 0.0f) {
                 state->rt->Release();
@@ -621,21 +619,21 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_overlayActive.store(true);
         SetPropW(hwnd, L"OverlayState", reinterpret_cast<HANDLE>(state));
 
-        UINT refresh = GetSystemRefreshRate();
-        SetTimer(hwnd, 1, refresh > 0 ? 1000 / refresh : 16, NULL); // Таймер рендера
-        SetTimer(hwnd, 2, 1000, NULL); // ✅ НОВЫЙ: Таймер принудительного удержания TOPMOST (каждые 1000мс)
+        // ✅ ОПТИМИЗАЦИЯ №2: Жёсткий лимит 60 FPS для UI. 
+        // Привязка к герцовке монитора (144Hz+) на слоеных окнах вызывает переполнение буфера DWM и скачки GPU.
+        SetTimer(hwnd, 1, 16, NULL);
+        SetTimer(hwnd, 2, 300, NULL); // Поддержание TOPMOST
 
         return 0;
     }
 
     case WM_TIMER: {
-        if (wParam == 1) { // Рендер эквалайзера
+        if (wParam == 1) { // Рендер эквалайзера (ограничен 30 FPS)
             OverlayState* s = reinterpret_cast<OverlayState*>(GetPropW(hwnd, L"OverlayState"));
             if (s && s->ready && s->rt) DrawEqualizer(s->rt, s);
         }
-        else if (wParam == 2) { // ✅ Удержание окна поверх всех окон (компенсирует Win+D и Shell)
+        else if (wParam == 2) { // Принудительное удержание поверх всех окон
             if (hOverlayWnd && IsWindow(hOverlayWnd)) {
-                // SWP_NOACTIVATE предотвращает перехват фокуса другими окнами при возврате оверлея наверх
                 SetWindowPos(hOverlayWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             }
         }
@@ -646,7 +644,6 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         OverlayState* s = reinterpret_cast<OverlayState*>(GetPropW(hwnd, L"OverlayState"));
         if (!s || !s->rt) return 0;
 
-        // ✅ Д2Д НЕ ПРИНИМАЕТ РАЗМЕР 0x0 НА СЛОЕННЫХ ОКНАХ → ВЫЗЫВАЕТ КРАШ
         int w = LOWORD(lParam);
         int h = HIWORD(lParam);
         if (w <= 0 || h <= 0) return 0;
@@ -657,10 +654,9 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     }
 
     case WM_DESTROY: {
-        // ✅ УБИВАЕМ ТАЙМЕР ДО ОЧИСТКИ ПАМЯТИ (устраняет use-after-free)
         g_overlayActive.store(false);
         KillTimer(hwnd, 1);
-        KillTimer(hwnd, 2); // ✅ Очищаем таймер TOPMOST
+        KillTimer(hwnd, 2);
 
         OverlayState* s = reinterpret_cast<OverlayState*>(GetPropW(hwnd, L"OverlayState"));
         if (s) {
