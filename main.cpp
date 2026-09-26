@@ -1,4 +1,4 @@
-//soluGGix v1.0.5 (c) GGee64
+//soluGGix v1.1 (c) GGee64
 
 #define INITGUID
 #include <windows.h>
@@ -206,7 +206,10 @@ private:
 
 public:
     bool StartWithRoutingWait() {
-        if (!Start()) return false;
+        if (!Start()) {
+            OutputDebugStringA("[Audio] Critical Error: Start() returned false.\n");
+            return false;
+        }
 
         const auto startTime = std::chrono::steady_clock::now();
         constexpr std::chrono::milliseconds maxWait(2000);
@@ -302,6 +305,25 @@ public:
             hnsPeriod, hnsBufferDuration, pwfxTemp->wFormatTag, pwfxTemp->nSamplesPerSec, pwfxTemp->wBitsPerSample, pwfxTemp->nChannels);
         OutputDebugStringA(fmtLog);
 
+        if (pwfxTemp->nChannels > 2) {
+            OutputDebugStringA("[Init] More than 2 channels detected. Dropback to Stereo, to avoid driver issues...\n");
+
+            pwfxTemp->nChannels = 2;
+            pwfxTemp->wBitsPerSample = 16;
+            pwfxTemp->nBlockAlign = (pwfxTemp->nChannels * pwfxTemp->wBitsPerSample) / 8;
+            pwfxTemp->nAvgBytesPerSec = pwfxTemp->nSamplesPerSec * pwfxTemp->nBlockAlign;
+
+            if (pwfxTemp->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
+                auto* ext = reinterpret_cast<WAVEFORMATEXTENSIBLE*>(pwfxTemp);
+                ext->Samples.wValidBitsPerSample = 16;
+                static const GUID guidPCM = { 0x00000001, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71} };
+                ext->SubFormat = guidPCM;
+            }
+            else {
+                pwfxTemp->wFormatTag = WAVE_FORMAT_PCM;
+            }
+        }
+
         hr = pClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_NOPERSIST, hnsBufferDuration, 0, pwfxTemp, NULL);
         if (FAILED(hr)) {
             char failLog[80]; sprintf_s(failLog, "[Init] Initialize FAILED: 0x%08X\n", hr); OutputDebugStringA(failLog);
@@ -327,6 +349,8 @@ public:
     }
 
     void Stop() {
+        OutputDebugStringA("[PulseDebug] >>> STOP() Called! <<<\n");
+
         if (!initialized) return;
         try {
             if (pClient) pClient->Stop();
@@ -340,13 +364,47 @@ public:
 
     void Update() {
         // Критичная проверка: если поток не активен или инвалидирован — игнорируем вызовы из анимационного потока
-        if (!initialized || !pCaptureClient) return;
+        if (initialized && (!pClient || !pCaptureClient)) {
+            OutputDebugStringA("[PulseWarning] Hardware loss of WASAPI pointer detected! Restoring...\n");
+            if (pClient) {
+                // Пробуем заново запросить сервис захвата у живого клиента
+                pClient->GetService(__uuidof(IAudioCaptureClient), (void**)&pCaptureClient);
+            }
+        }
+
+        // Если восстановить не удалось или поток реально не инициализирован — выходим
+        if (!initialized || !pCaptureClient) {
+            static int errCount = 0;
+            if (errCount++ % 150 == 0) {
+                OutputDebugStringA("[PulseWarning] Update() called, but initialized == false or pointers NULL!\n");
+            }
+            return;
+        }
 
         std::lock_guard<std::mutex> lock(mtx);
         float targets[64] = {};
 
         DWORD flags = 0; BYTE* pData = nullptr; UINT32 numFrames = 0;
         HRESULT hr = pCaptureClient->GetBuffer(&pData, &numFrames, &flags, nullptr, nullptr);
+
+        static int errCounter = 0;
+        if (errCounter++ % 100 == 0) { // Пишем часто, чтобы сразу поймать статус кадра
+            char logBuf[256];
+            sprintf_s(logBuf, "[PulseDebug] hr = 0x%08X | numFrames = %u | flags = 0x%X\n", hr, numFrames, flags);
+            OutputDebugStringA(logBuf);
+
+            if (FAILED(hr)) {
+                char failBuf[256];
+                sprintf_s(failBuf, "[PulseWarning] GetBuffer crashed! Error: 0x%08X\n", hr);
+                OutputDebugStringA(failBuf);
+            }
+            if (numFrames == 0) {
+                OutputDebugStringA("[PulseWarning] Frames empty (numFrames == 0). Driver isn't generating frames.\n");
+            }
+            if (flags & 0x8) {
+                OutputDebugStringA("[PulseWarning] Warning! Driver muffles sound (SILENT is active).\n");
+            }
+        }
 
         if (hr == AUDCLNT_E_DEVICE_INVALIDATED) {
             streamInvalidated.store(true);
@@ -364,22 +422,59 @@ public:
             return;
         }
 
-        // Shared Loopback ВСЕГДА стерео-дамник (2 канала). Не доверяем метаданным устройства.
-        const int ch = 2;
-        bool isFloat = false;
+        static int logCounter = 0;
+        if (logCounter++ % 100 == 0) { // Логируем каждый 100-й кадр, чтобы не спамить консоль
+            char debugBuf[512];
 
-        if (pwfx->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) {
-            isFloat = true;
+            // 1. Проверяем каналы и тег формата, которые определила звуковая карта
+            int actualChannels = pwfx ? pwfx->nChannels : 0;
+            int formatTag = pwfx ? pwfx->wFormatTag : 0;
+
+            // 2. Считаем сырую энергию в буфере ДО ReleaseBuffer (берем первые 100 байт)
+            double energyBefore = 0.0;
+            float* fData = reinterpret_cast<float*>(pData);
+            for (UINT32 i = 0; i < (numFrames < 50 ? numFrames : 50); ++i) {
+                energyBefore += fabsf(fData[i]);
+            }
+
+            // 3. Заглядываем в память, которая была освобождена на ПРОШЛОМ кадре (тестируем samples)
+            // Мы берем твой старый указатель (если он остался глобальным или статическим)
+            // Или просто симулируем чтение после вызова Release в тестовых целях:
+            double energyAfterTest = 0.0;
+
+            sprintf_s(debugBuf,
+                "[PulseDebug] FORMAT TAG: 0x%04X | CHANNELS: %d | FRAMES: %u | ENERGY BEFORE RELEASE: %.6f\n",
+                formatTag, actualChannels, numFrames, energyBefore);
+            OutputDebugStringA(debugBuf);
+
+            // Если каналов больше 2, выводим предупреждение
+            if (actualChannels > 2) {
+                OutputDebugStringA("[PulseWarning] Warning! System gives more than 2 channels. ch=2 breaks reading!\n");
+            }
+            // Если энергия до релиза равна 0 при включенной музыке — Windows блокирует поток (DRM/Spatial)
+            if (energyBefore < 0.000001f) {
+                OutputDebugStringA("[PulseWarning] Warning! From Windows buffer come nulls. Stream locked by system.\n");
+            }
         }
-        else if (pwfx->wFormatTag == WAVE_FORMAT_EXTENSIBLE && pwfx->cbSize >= sizeof(WAVEFORMATEXTENSIBLE)) {
+
+        // Shared Loopback. доверяем метаданным устройства.
+        const int ch = (pwfx && pwfx->nChannels > 0) ? pwfx->nChannels : 2;
+
+        // Ноутбук выдает 32 бита PCM. Запрещаем режим Float для 32 бит.
+        bool isFloat = (pwfx->wFormatTag == WAVE_FORMAT_IEEE_FLOAT);
+        if (pwfx->wFormatTag == WAVE_FORMAT_EXTENSIBLE && pwfx->cbSize >= sizeof(WAVEFORMATEXTENSIBLE)) {
             const auto* ext = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(pwfx);
-            static const unsigned char pcmSig[] = { 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 };
-            if (memcmp(&ext->SubFormat, pcmSig, 16) == 0) isFloat = false;
+            if (ext->SubFormat.Data1 == 3) {
+                isFloat = true;
+            }
         }
-        // Fallback для DRM/SPDIF/зашифрованных выходов: считаем как float (безопаснее для loopback)
-        if (!isFloat && pwfx->wFormatTag != WAVE_FORMAT_PCM) isFloat = true;
 
-        // ✅ КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: Нормализация по пику кадра (обходит системную громкость на любом выводе)
+        // 🟢 КРИТИЧЕСКИЙ ФИКС ДЛЯ НОУТБУКА:
+        // Если звуковая карта вернула Bits=32, но при этом лог выдает дикий мусор — это ЦЕЛОЧИСЛЕННЫЙ Int32 поток!
+        if (pwfx->wBitsPerSample == 32) {
+            isFloat = false;
+        }
+
         double maxInFrame = 0.0;
         if (isFloat || pwfx->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) {
             const float* fSamp = reinterpret_cast<const float*>(pData);
@@ -794,7 +889,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         nid.cbSize = sizeof(NOTIFYICONDATA); nid.hWnd = hMainWnd = hwnd; nid.uID = 1; nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         nid.uCallbackMessage = WM_USER + 1; nid.uVersion = NOTIFYICON_VERSION_4;
 
-        HICON hTempIcon = (HICON)LoadImageW(GetModuleHandle(NULL), MAKEINTRESOURCEW(1), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
+        HICON hTempIcon = (HICON)LoadImageW(GetModuleHandle(NULL), MAKEINTRESOURCEW(110), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
         if (!hTempIcon || hTempIcon == (HICON)-1) { OutputDebugStringW(L"[Tray] Equalizer.ico not found. Using fallback.\n"); hTempIcon = LoadIconW(NULL, IDI_APPLICATION); }
         nid.hIcon = hTempIcon; hTrayIcon = hTempIcon; wcscpy_s(nid.szTip, _countof(nid.szTip), L"Pulsar GG");
 
