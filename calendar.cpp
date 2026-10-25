@@ -148,7 +148,7 @@ namespace Cal {
     static AnimationState g_anim;
 
     IDWriteFontCollection* CreateCollectionFromResource(IDWriteFactory* factory, MemoryFontFileLoader*& loader, int resId) {
-        HRSRC hRes = FindResourceW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(resId), L"RCDATA");
+        HRSRC hRes = FindResourceW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(resId), L"IDR_MY_FONT");
         if (!hRes) return nullptr;
         HGLOBAL hGlob = LoadResource(GetModuleHandleW(NULL), hRes);
         if (!hGlob) return nullptr;
@@ -178,7 +178,7 @@ namespace Cal {
         wchar_t* pSlash = wcsrchr(exeDir, L'\\'); if (pSlash) *(pSlash + 1) = '\0';
 
         bool elvLoaded = false;
-        HRSRC hRes = FindResourceW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(106), L"RCDATA");
+        HRSRC hRes = FindResourceW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(ELVISH_FONT_ID), L"IDR_MY_FONT");
         if (hRes) {
             HGLOBAL hGlob = LoadResource(GetModuleHandleW(NULL), hRes);
             if (hGlob) { LPVOID pData = LockResource(hGlob); DWORD sz = SizeofResource(GetModuleHandleW(NULL), hRes); ULONG c = 0; HANDLE f = AddFontMemResourceEx(pData, sz, nullptr, &c); elvLoaded = (f != nullptr && c > 0); }
@@ -186,7 +186,7 @@ namespace Cal {
         if (!elvLoaded) { wchar_t path1[MAX_PATH]; wcscpy_s(path1, MAX_PATH, exeDir); wcscat_s(path1, MAX_PATH, L"elvish.ttf"); AddFontResourceW(path1); }
 
         bool dayLoaded = false;
-        HRSRC hResD = FindResourceW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(107), L"RCDATA");
+        HRSRC hResD = FindResourceW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(107), L"IDR_MY_FONT");
         if (hResD) {
             HGLOBAL hGlobD = LoadResource(GetModuleHandleW(NULL), hResD);
             if (hGlobD) { LPVOID pDataD = LockResource(hGlobD); DWORD szD = SizeofResource(GetModuleHandleW(NULL), hResD); ULONG c = 0; HANDLE f2 = AddFontMemResourceEx(pDataD, szD, nullptr, &c); dayLoaded = (f2 != nullptr && c > 0); }
