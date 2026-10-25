@@ -387,10 +387,9 @@ public:
         if (!initialized || !pCaptureClient) return;
 
         std::lock_guard<std::mutex> lock(mtx);
-        float targets[64] = {}; // 🟢 ИСПРАВЛЕНО: Явный массив на 64 элемента (убирает E0020/E0169)
+        float targets[64] = { 0 };
         double totalEnergy = 0.0;
 
-        // 🟢 ИСПРАВЛЕНО: Накопительный буфер для высокой точности БПФ джаза
         static std::vector<float> audioHistory;
 
         DWORD flags = 0; BYTE* pData = nullptr; UINT32 numFrames = 0;
@@ -416,102 +415,138 @@ public:
             const auto* ext = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(pwfx);
             subTag = ext->SubFormat.Data1;
         }
-        bool isFloat = (subTag == 3 || pwfx->wFormatTag == WAVE_FORMAT_IEEE_FLOAT);
-        if (pwfx->wBitsPerSample == 16) isFloat = false;
 
-        // Переводим любой формат звука ноута/ПК в чистый float-массив для БПФ
+        bool isFloat = (subTag == 3 || pwfx->wFormatTag == WAVE_FORMAT_IEEE_FLOAT);
+        bool isInt16 = (pwfx->wBitsPerSample == 16);
+        bool isInt32 = (pwfx->wBitsPerSample == 32 && !isFloat);
+        if (isInt16) isFloat = false;
+
+        // 🟢 ИСПРАВЛЕНО: Объявляем maxInFrame строго ТУТ, чтобы её видели все циклы ниже
+        double maxInFrame = 0.0;
+        static int debugCounter = 0;
+        bool shouldLog = (debugCounter++ % 100 == 0);
+
+        if (shouldLog) {
+            char debugHead[256];
+            sprintf_s(debugHead, "[AudioDebug] Frame arrived: numFrames=%u, ch=%d, bits=%u, subTag=0x%04X\n",
+                numFrames, ch, pwfx->wBitsPerSample, subTag);
+            OutputDebugStringA(debugHead);
+        }
+
         if (isFloat) {
+            if (shouldLog) OutputDebugStringA("[AudioDebug] Processing branch: FLOAT\n");
             const float* fSamp = reinterpret_cast<const float*>(pData);
             for (UINT32 i = 0; i < numFrames; ++i) {
-                float mono = (fSamp[i * ch + 0] + ((ch > 1) ? fSamp[i * ch + 1] : fSamp[i * ch + 0])) * 0.5f;
-                audioHistory.push_back(mono);
+                float sL = fSamp[i * ch + 0];
+                float sR = (ch > 1) ? fSamp[i * ch + 1] : sL;
+                audioHistory.push_back((sL + sR) * 0.5f);
+                if (fabsf(sL) > maxInFrame) maxInFrame = fabsf(sL);
+                if (fabsf(sR) > maxInFrame) maxInFrame = fabsf(sR);
             }
         }
-        else if (pwfx->wBitsPerSample == 16) {
+        else if (isInt16) {
+            if (shouldLog) OutputDebugStringA("[AudioDebug] Processing branch: INT16\n");
             const int16_t* iSamp = reinterpret_cast<const int16_t*>(pData);
             for (UINT32 i = 0; i < numFrames; ++i) {
                 float sL = static_cast<float>(iSamp[i * ch + 0]) / 32768.0f;
                 float sR = (ch > 1) ? static_cast<float>(iSamp[i * ch + 1]) / 32768.0f : sL;
                 audioHistory.push_back((sL + sR) * 0.5f);
+                if (fabsf(sL) > maxInFrame) maxInFrame = fabsf(sL);
+                if (fabsf(sR) > maxInFrame) maxInFrame = fabsf(sR);
             }
         }
-        else if (pwfx->wBitsPerSample == 32) {
+        else if (isInt32) {
+            if (shouldLog) OutputDebugStringA("[AudioDebug] Processing branch: INT32\n");
             const int32_t* iSamp = reinterpret_cast<const int32_t*>(pData);
             for (UINT32 i = 0; i < numFrames; ++i) {
                 float sL = static_cast<float>(iSamp[i * ch + 0]) / 2147483648.0f;
                 float sR = (ch > 1) ? static_cast<float>(iSamp[i * ch + 1]) / 2147483648.0f : sL;
                 audioHistory.push_back((sL + sR) * 0.5f);
+                if (fabsf(sL) > maxInFrame) maxInFrame = fabsf(sL);
+                if (fabsf(sR) > maxInFrame) maxInFrame = fabsf(sR);
             }
         }
 
-        // Вычисляем оригинальный пик кадра для честной завязки на ручку громкости
-        double maxInFrame = 0.0;
-        if (audioHistory.size() >= numFrames) {
-            for (size_t i = audioHistory.size() - numFrames; i < audioHistory.size(); ++i) {
-                double val = fabsf(audioHistory[i]);
-                if (val > maxInFrame) maxInFrame = val;
-            }
+        if (shouldLog) {
+            char peakLog[256];
+            sprintf_s(peakLog, "[AudioDebug] Calculated maxInFrame: %f\n", maxInFrame);
+            OutputDebugStringA(peakLog);
         }
 
         pCaptureClient->ReleaseBuffer(numFrames);
 
-        // Удерживаем историю строго на 1024 отсчетах для детального БПФ-спектра
-        size_t fftSize = 1024;
-        if (audioHistory.size() > fftSize) {
-            audioHistory.erase(audioHistory.begin(), audioHistory.begin() + (audioHistory.size() - fftSize));
+        size_t fftSize = 1;
+        while (fftSize < numFrames && fftSize < 512) {
+            fftSize <<= 1;
         }
+        if (fftSize > numFrames) fftSize >>= 1;
 
-        if (audioHistory.size() < fftSize) {
+        if (fftSize < 64) {
             for (int i = 0; i < numBands; ++i) bands[i].update(0.0f);
             return;
         }
 
         std::vector<std::complex<float>> fftData(fftSize, 0.0f);
+        size_t historyOffset = audioHistory.size() - fftSize;
         for (size_t i = 0; i < fftSize; ++i) {
-            // Окно Хеннинга: убирает паразитную "кашу" БПФ алгоритма, выделяя чистые ноты
             float window = 0.5f * (1.0f - cosf(2.0f * 3.14159265f * i / (fftSize - 1)));
-            fftData[i] = audioHistory[i] * window;
+            fftData[i] = audioHistory[historyOffset + i] * window;
         }
+        audioHistory.clear();
 
         FFT_Base(fftData, false);
 
         const double SILENCE_FLOOR = 0.002;
 
+        // 🟢 ИДЕАЛЬНЫЙ ТЮНИНГ ДЛЯ ПК (БЕЗ ИСКУССТВЕННОГО БУСТА СЧ/ВЧ)
         for (int band = 0; band < numBands; ++band) {
             float t = (float)band / numBands;
 
-            // Распределяем 64 полосы по 512 частотам БПФ. Сдвиг возведен в квадрат (powf),
-            // чтобы левая половина детально отыгрывала БАСЫ джаза, а правая — молчала на верхах.
-            size_t freqIdx = 1 + static_cast<size_t>(powf(t, 2.0f) * (fftSize / 2 - 5));
+            // Твое идеальное разделение по частотам
+            size_t freqIdx = 1 + static_cast<size_t>(powf(t, 1.5f) * (fftSize / 2 - 2));
             if (freqIdx >= fftSize / 2) freqIdx = fftSize / 2 - 1;
 
             double rms = std::abs(fftData[freqIdx]) / (fftSize / 2.0f);
+
+            // 🟢 АДАПТИВНЫЙ БУСТ: Для ноута (ch > 2) оставляем подъем частот.
+            // Для ПК (ch == 2) буст СТРОГО равен 1.0 — мы вообще не трогаем чистый сигнал карточки!
+            float freqBoost = (ch > 2) ? (1.0f + (t * 2.5f) + (powf(t, 3.0f) * 3.5f)) : 1.0f;
+            rms *= freqBoost;
+
             float bandVal = 0.0f;
 
-            // 🟢 ЧЕСТНАЯ ПРИВЯЗКА К ГРОМКОСТИ: При тишине музыкальный сигнал падает строго в пол
-            if (maxInFrame < SILENCE_FLOOR) {
-                bandVal = 0.0f;
-            }
-            else {
-                if (rms > 0.00001) {
-                    float db = 20.0f * log10f(static_cast<float>(rms));
-                    bandVal = (db + 45.0f) / 40.0f;
-                    if (bandVal < 0.0f) bandVal = 0.0f;
+            if (rms > 0.00001) {
+                float db = 20.0f * log10f(static_cast<float>(rms));
+
+                // 🟢 РАСШИРЕННЫЙ ДИНАМИЧЕСКИЙ ДИАПАЗОН ДЛЯ ПК:
+                // Для ноута (ch > 2) оставляем проверенные -44 дБ / шаг 36.
+                // Для ПК (ch == 2) опускаем пол до -54 дБ, а диапазон деления увеличиваем до 54.
+                // Это жестко прижмет общую высоту банд к полу и не даст им долбиться в потолок.
+                float floorDb = (ch > 2) ? -44.0f : -54.0f;
+                float rangeDb = (ch > 2) ? 36.0f : 54.0f;
+
+                bandVal = (db - floorDb) / rangeDb;
+
+                // На ПК (ch == 2) дополнительно слегка занижаем итоговую высоту (на 20%),
+                // чтобы полосы ходили строго в красивом среднем диапазоне экрана
+                if (ch == 2) {
+                    bandVal *= 0.8f;
                 }
 
-                // Линейный буст, привязанный к ручке громкости Windows. Без компрессии frameScale!
-                float volumeScale = static_cast<float>(maxInFrame) * 4.5f;
-                if (volumeScale > 1.0f) volumeScale = 1.0f;
-                bandVal *= volumeScale;
+                if (bandVal < 0.0f) bandVal = 0.0f;
+            }
+
+            // Твое мягкое сглаживание соседних банд для баса
+            if (band > 0 && t < 0.3f) {
+                bandVal = (bandVal * 0.6f) + (targets[band - 1] * 0.4f);
             }
 
             targets[band] = (bandVal < 0.0f) ? 0.0f : ((bandVal > 1.0f) ? 1.0f : bandVal);
             totalEnergy += targets[band];
         }
 
-        // Применяем твою родную логику затухания
         for (int i = 0; i < numBands; ++i) bands[i].update(targets[i]);
-    } // 🟢 Лишняя скобка } убрана отсюда, теперь класс не ломается!
+} // Конец метода Update
 
     Band GetBand(int i) const {
         if (i < 0 || i >= numBands) return Band();
