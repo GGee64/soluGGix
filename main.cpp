@@ -1,4 +1,4 @@
-//soluGGix v1.1 (c) GGee64
+//soluGGix v1.15 (c) GGee64
 
 #define INITGUID
 #include <windows.h>
@@ -21,6 +21,8 @@
 #include <cstring>
 #include <cstdint>
 #include "resource.h"
+#include <complex>
+#include <vector>
 
 #ifndef AUDCLNT_BUFFERFLAGS_SILENT
 #define AUDCLNT_BUFFERFLAGS_SILENT 0x8
@@ -55,6 +57,25 @@ std::atomic<bool> g_deviceChanged{ false };
 std::atomic<bool> g_streamInvalidated{ false }; // Для AUDCLNT_E_DEVICE_INVALIDATED
 std::atomic<bool> g_overlayActive = false;
 int screenWidth = 0, screenHeight = 0;
+
+void FFT_Base(std::vector<std::complex<float>>& a, bool invert) {
+    size_t n = a.size();
+    if (n <= 1) return;
+    std::vector<std::complex<float>> a0(n / 2), a1(n / 2);
+    for (size_t i = 0; i * 2 < n; ++i) {
+        a0[i] = a[i * 2];
+        a1[i] = a[i * 2 + 1];
+    }
+    FFT_Base(a0, invert); FFT_Base(a1, invert);
+    float ang = 2 * 3.1415926535f / n * (invert ? -1 : 1);
+    std::complex<float> w(1), wn(cos(ang), sin(ang));
+    for (size_t i = 0; i * 2 < n; ++i) {
+        a[i] = a0[i] + w * a1[i];
+        a[i + n / 2] = a0[i] - w * a1[i];
+        if (invert) { a[i] /= 2; a[i + n / 2] /= 2; }
+        w *= wn;
+    }
+}
 
 static UINT GetSystemRefreshRate() {
     DEVMODE dm = {};
@@ -363,48 +384,17 @@ public:
     }
 
     void Update() {
-        // Критичная проверка: если поток не активен или инвалидирован — игнорируем вызовы из анимационного потока
-        if (initialized && (!pClient || !pCaptureClient)) {
-            OutputDebugStringA("[PulseWarning] Hardware loss of WASAPI pointer detected! Restoring...\n");
-            if (pClient) {
-                // Пробуем заново запросить сервис захвата у живого клиента
-                pClient->GetService(__uuidof(IAudioCaptureClient), (void**)&pCaptureClient);
-            }
-        }
-
-        // Если восстановить не удалось или поток реально не инициализирован — выходим
-        if (!initialized || !pCaptureClient) {
-            static int errCount = 0;
-            if (errCount++ % 150 == 0) {
-                OutputDebugStringA("[PulseWarning] Update() called, but initialized == false or pointers NULL!\n");
-            }
-            return;
-        }
+        if (!initialized || !pCaptureClient) return;
 
         std::lock_guard<std::mutex> lock(mtx);
-        float targets[64] = {};
+        float targets[64] = {}; // 🟢 ИСПРАВЛЕНО: Явный массив на 64 элемента (убирает E0020/E0169)
+        double totalEnergy = 0.0;
+
+        // 🟢 ИСПРАВЛЕНО: Накопительный буфер для высокой точности БПФ джаза
+        static std::vector<float> audioHistory;
 
         DWORD flags = 0; BYTE* pData = nullptr; UINT32 numFrames = 0;
         HRESULT hr = pCaptureClient->GetBuffer(&pData, &numFrames, &flags, nullptr, nullptr);
-
-        static int errCounter = 0;
-        if (errCounter++ % 100 == 0) { // Пишем часто, чтобы сразу поймать статус кадра
-            char logBuf[256];
-            sprintf_s(logBuf, "[PulseDebug] hr = 0x%08X | numFrames = %u | flags = 0x%X\n", hr, numFrames, flags);
-            OutputDebugStringA(logBuf);
-
-            if (FAILED(hr)) {
-                char failBuf[256];
-                sprintf_s(failBuf, "[PulseWarning] GetBuffer crashed! Error: 0x%08X\n", hr);
-                OutputDebugStringA(failBuf);
-            }
-            if (numFrames == 0) {
-                OutputDebugStringA("[PulseWarning] Frames empty (numFrames == 0). Driver isn't generating frames.\n");
-            }
-            if (flags & 0x8) {
-                OutputDebugStringA("[PulseWarning] Warning! Driver muffles sound (SILENT is active).\n");
-            }
-        }
 
         if (hr == AUDCLNT_E_DEVICE_INVALIDATED) {
             streamInvalidated.store(true);
@@ -412,134 +402,116 @@ public:
             return;
         }
 
-        // Ошибка захвата (не инвалидация) — не вызываем ReleaseBuffer! Ждём следующего кадра от драйвера.
         if (FAILED(hr)) return;
 
-        // Очередь пуста или нет данных → корректно разблокируем пакет и гасим полосу через decay
         if (numFrames == 0 || !pData) {
             pCaptureClient->ReleaseBuffer(0);
             for (int i = 0; i < numBands; ++i) bands[i].update(0.0f);
             return;
         }
 
-        static int logCounter = 0;
-        if (logCounter++ % 100 == 0) { // Логируем каждый 100-й кадр, чтобы не спамить консоль
-            char debugBuf[512];
-
-            // 1. Проверяем каналы и тег формата, которые определила звуковая карта
-            int actualChannels = pwfx ? pwfx->nChannels : 0;
-            int formatTag = pwfx ? pwfx->wFormatTag : 0;
-
-            // 2. Считаем сырую энергию в буфере ДО ReleaseBuffer (берем первые 100 байт)
-            double energyBefore = 0.0;
-            float* fData = reinterpret_cast<float*>(pData);
-            for (UINT32 i = 0; i < (numFrames < 50 ? numFrames : 50); ++i) {
-                energyBefore += fabsf(fData[i]);
-            }
-
-            // 3. Заглядываем в память, которая была освобождена на ПРОШЛОМ кадре (тестируем samples)
-            // Мы берем твой старый указатель (если он остался глобальным или статическим)
-            // Или просто симулируем чтение после вызова Release в тестовых целях:
-            double energyAfterTest = 0.0;
-
-            sprintf_s(debugBuf,
-                "[PulseDebug] FORMAT TAG: 0x%04X | CHANNELS: %d | FRAMES: %u | ENERGY BEFORE RELEASE: %.6f\n",
-                formatTag, actualChannels, numFrames, energyBefore);
-            OutputDebugStringA(debugBuf);
-
-            // Если каналов больше 2, выводим предупреждение
-            if (actualChannels > 2) {
-                OutputDebugStringA("[PulseWarning] Warning! System gives more than 2 channels. ch=2 breaks reading!\n");
-            }
-            // Если энергия до релиза равна 0 при включенной музыке — Windows блокирует поток (DRM/Spatial)
-            if (energyBefore < 0.000001f) {
-                OutputDebugStringA("[PulseWarning] Warning! From Windows buffer come nulls. Stream locked by system.\n");
-            }
-        }
-
-        // Shared Loopback. доверяем метаданным устройства.
         const int ch = (pwfx && pwfx->nChannels > 0) ? pwfx->nChannels : 2;
-
-        // Ноутбук выдает 32 бита PCM. Запрещаем режим Float для 32 бит.
-        bool isFloat = (pwfx->wFormatTag == WAVE_FORMAT_IEEE_FLOAT);
+        WORD subTag = pwfx->wFormatTag;
         if (pwfx->wFormatTag == WAVE_FORMAT_EXTENSIBLE && pwfx->cbSize >= sizeof(WAVEFORMATEXTENSIBLE)) {
             const auto* ext = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(pwfx);
-            if (ext->SubFormat.Data1 == 3) {
-                isFloat = true;
-            }
+            subTag = ext->SubFormat.Data1;
         }
+        bool isFloat = (subTag == 3 || pwfx->wFormatTag == WAVE_FORMAT_IEEE_FLOAT);
+        if (pwfx->wBitsPerSample == 16) isFloat = false;
 
-        // 🟢 КРИТИЧЕСКИЙ ФИКС ДЛЯ НОУТБУКА:
-        // Если звуковая карта вернула Bits=32, но при этом лог выдает дикий мусор — это ЦЕЛОЧИСЛЕННЫЙ Int32 поток!
-        if (pwfx->wBitsPerSample == 32) {
-            isFloat = false;
-        }
-
-        double maxInFrame = 0.0;
-        if (isFloat || pwfx->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) {
+        // Переводим любой формат звука ноута/ПК в чистый float-массив для БПФ
+        if (isFloat) {
             const float* fSamp = reinterpret_cast<const float*>(pData);
             for (UINT32 i = 0; i < numFrames; ++i) {
-                double s = fabsf(fSamp[i * ch + 0]); double r = fabsf(fSamp[i * ch + 1]);
-                if (s > maxInFrame) maxInFrame = s;
-                if (r > maxInFrame) maxInFrame = r;
+                float mono = (fSamp[i * ch + 0] + ((ch > 1) ? fSamp[i * ch + 1] : fSamp[i * ch + 0])) * 0.5f;
+                audioHistory.push_back(mono);
             }
         }
-        else {
+        else if (pwfx->wBitsPerSample == 16) {
             const int16_t* iSamp = reinterpret_cast<const int16_t*>(pData);
             for (UINT32 i = 0; i < numFrames; ++i) {
-                double s = static_cast<double>(abs(iSamp[i * ch + 0])) / 32768.0;
-                double r = static_cast<double>(abs(iSamp[i * ch + 1])) / 32768.0;
-                if (s > maxInFrame) maxInFrame = s;
-                if (r > maxInFrame) maxInFrame = r;
+                float sL = static_cast<float>(iSamp[i * ch + 0]) / 32768.0f;
+                float sR = (ch > 1) ? static_cast<float>(iSamp[i * ch + 1]) / 32768.0f : sL;
+                audioHistory.push_back((sL + sR) * 0.5f);
+            }
+        }
+        else if (pwfx->wBitsPerSample == 32) {
+            const int32_t* iSamp = reinterpret_cast<const int32_t*>(pData);
+            for (UINT32 i = 0; i < numFrames; ++i) {
+                float sL = static_cast<float>(iSamp[i * ch + 0]) / 2147483648.0f;
+                float sR = (ch > 1) ? static_cast<float>(iSamp[i * ch + 1]) / 2147483648.0f : sL;
+                audioHistory.push_back((sL + sR) * 0.5f);
             }
         }
 
-        // Ниже порога аппаратного шума → это тишина. Масштаб = 0 (убивает ложный пульс на 0% и дребезг волн)
-        const double SILENCE_FLOOR = 0.002;
-        float frameScale = (maxInFrame < SILENCE_FLOOR) ? 0.0f : (0.25f / static_cast<float>(maxInFrame));
+        // Вычисляем оригинальный пик кадра для честной завязки на ручку громкости
+        double maxInFrame = 0.0;
+        if (audioHistory.size() >= numFrames) {
+            for (size_t i = audioHistory.size() - numFrames; i < audioHistory.size(); ++i) {
+                double val = fabsf(audioHistory[i]);
+                if (val > maxInFrame) maxInFrame = val;
+            }
+        }
 
-        // ВАЖНО: ReleaseBuffer вызывается ровно один раз после GetBuffer (по spec WASAPI)
         pCaptureClient->ReleaseBuffer(numFrames);
 
-        double totalEnergy = 0.0;
-        float step = static_cast<float>(numFrames) / numBands;
-        const void* samples = pData;
+        // Удерживаем историю строго на 1024 отсчетах для детального БПФ-спектра
+        size_t fftSize = 1024;
+        if (audioHistory.size() > fftSize) {
+            audioHistory.erase(audioHistory.begin(), audioHistory.begin() + (audioHistory.size() - fftSize));
+        }
+
+        if (audioHistory.size() < fftSize) {
+            for (int i = 0; i < numBands; ++i) bands[i].update(0.0f);
+            return;
+        }
+
+        std::vector<std::complex<float>> fftData(fftSize, 0.0f);
+        for (size_t i = 0; i < fftSize; ++i) {
+            // Окно Хеннинга: убирает паразитную "кашу" БПФ алгоритма, выделяя чистые ноты
+            float window = 0.5f * (1.0f - cosf(2.0f * 3.14159265f * i / (fftSize - 1)));
+            fftData[i] = audioHistory[i] * window;
+        }
+
+        FFT_Base(fftData, false);
+
+        const double SILENCE_FLOOR = 0.002;
 
         for (int band = 0; band < numBands; ++band) {
-            int startIdx = static_cast<int>(floorf(band * step));
-            int endIdx = static_cast<int>(ceilf((band + 1) * step));
-            if (endIdx > numFrames) endIdx = numFrames;
+            float t = (float)band / numBands;
 
-            double sumSq = 0.0; int count = 0;
+            // Распределяем 64 полосы по 512 частотам БПФ. Сдвиг возведен в квадрат (powf),
+            // чтобы левая половина детально отыгрывала БАСЫ джаза, а правая — молчала на верхах.
+            size_t freqIdx = 1 + static_cast<size_t>(powf(t, 2.0f) * (fftSize / 2 - 5));
+            if (freqIdx >= fftSize / 2) freqIdx = fftSize / 2 - 1;
 
-            if (isFloat || pwfx->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) {
-                const float* fSamp = reinterpret_cast<const float*>(samples);
-                for (int i = startIdx; i < endIdx; ++i, ++count) {
-                    double sL = fabsf(fSamp[i * ch + 0]); double sR = fabsf(fSamp[i * ch + 1]);
-                    sumSq += sL * sL + sR * sR;
-                }
+            double rms = std::abs(fftData[freqIdx]) / (fftSize / 2.0f);
+            float bandVal = 0.0f;
+
+            // 🟢 ЧЕСТНАЯ ПРИВЯЗКА К ГРОМКОСТИ: При тишине музыкальный сигнал падает строго в пол
+            if (maxInFrame < SILENCE_FLOOR) {
+                bandVal = 0.0f;
             }
             else {
-                const int16_t* iSamp = reinterpret_cast<const int16_t*>(samples);
-                for (int k = startIdx; k < endIdx; ++k, ++count) {
-                    float sL = static_cast<float>(abs(iSamp[k * ch + 0])) / 32768.0f;
-                    float sR = static_cast<float>(abs(iSamp[k * ch + 1])) / 32768.0f;
-                    sumSq += sL * sL + sR * sR;
+                if (rms > 0.00001) {
+                    float db = 20.0f * log10f(static_cast<float>(rms));
+                    bandVal = (db + 45.0f) / 40.0f;
+                    if (bandVal < 0.0f) bandVal = 0.0f;
                 }
-            }
 
-            double rms = count > 0 ? sqrt(sumSq / count) : 0.0;
-            // Масштабируем RMS относительно пика кадра, а не абсолютного значения
-            float bandVal = static_cast<float>(rms * frameScale);
+                // Линейный буст, привязанный к ручке громкости Windows. Без компрессии frameScale!
+                float volumeScale = static_cast<float>(maxInFrame) * 4.5f;
+                if (volumeScale > 1.0f) volumeScale = 1.0f;
+                bandVal *= volumeScale;
+            }
 
             targets[band] = (bandVal < 0.0f) ? 0.0f : ((bandVal > 1.0f) ? 1.0f : bandVal);
             totalEnergy += targets[band];
         }
 
-        // ТВОЯ ЛОГИКА ОБНОВЛЕНИЯ БЕЗ ИЗМЕНЕНИЙ
+        // Применяем твою родную логику затухания
         for (int i = 0; i < numBands; ++i) bands[i].update(targets[i]);
-    }
-
+    } // 🟢 Лишняя скобка } убрана отсюда, теперь класс не ломается!
 
     Band GetBand(int i) const {
         if (i < 0 || i >= numBands) return Band();
@@ -612,14 +584,16 @@ void DrawEqualizer(ID2D1HwndRenderTarget* rt, const OverlayState* state) {
 
     float waveAmp = maxGrowW * 0.28f; // Базовая амплитуда волн в тишине
 
-    // === ЛЕВАЯ СТОРОНА (безопасное переключение без схлопывания ширины) ===
+    // === ЛЕВАЯ СТОРОНА (Теперь зеркально басы внизу, верха вверху, как справа) ===
     for (int i = 0; i < NUM_BANDS; ++i) {
         if (!state->brushes[i]) continue;
-        float audioW = data[i].value * maxGrowW;
+
+        // 🟢 ИСПРАВЛЕНИЕ ИНДЕКСА: Разворачиваем частоты, чтобы бас ушел вниз экрана
+        int bIdx = NUM_BANDS - 1 - i;
+
+        float audioW = data[bIdx].value * maxGrowW;
         float waveW = waveP[i] * waveAmp * waveState;
 
-        // Если тишина (waveState ≈ 1) → рисуем волны. Иначе строго по пульсу.
-        // Никогда не умножаем на waveState при музыке, иначе ширина уйдёт в 0.
         float w = (smoothEnergy < WAVE_ON_THRESH) ? waveW : audioW;
         if (w < 2.0f) w = 2.0f;
         rt->FillRectangle(D2D1::RectF(marginX, i * (barH + gapY), marginX + w, i * (barH + gapY) + barH), state->brushes[i]);
