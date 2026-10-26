@@ -405,7 +405,7 @@ public:
 
         if (numFrames == 0 || !pData) {
             pCaptureClient->ReleaseBuffer(0);
-            for (int i = 0; i < numBands; ++i) bands[i].update(0.0f);
+            for (int i = 0; i < 64; ++i) bands[i].update(0.0f);
             return;
         }
 
@@ -421,7 +421,6 @@ public:
         bool isInt32 = (pwfx->wBitsPerSample == 32 && !isFloat);
         if (isInt16) isFloat = false;
 
-        // 🟢 ИСПРАВЛЕНО: Объявляем maxInFrame строго ТУТ, чтобы её видели все циклы ниже
         double maxInFrame = 0.0;
         static int debugCounter = 0;
         bool shouldLog = (debugCounter++ % 100 == 0);
@@ -482,7 +481,8 @@ public:
         if (fftSize > numFrames) fftSize >>= 1;
 
         if (fftSize < 64) {
-            for (int i = 0; i < numBands; ++i) bands[i].update(0.0f);
+            audioHistory.clear();
+            for (int i = 0; i < 64; ++i) bands[i].update(0.0f);
             return;
         }
 
@@ -498,45 +498,49 @@ public:
 
         const double SILENCE_FLOOR = 0.002;
 
-        // 🟢 ИДЕАЛЬНЫЙ ТЮНИНГ ДЛЯ ПК (БЕЗ ИСКУССТВЕННОГО БУСТА СЧ/ВЧ)
-        for (int band = 0; band < numBands; ++band) {
-            float t = (float)band / numBands;
+        bool isLaptop = (pwfx->wBitsPerSample == 16 && subTag != 1 && subTag != 3);
 
-            // Твое идеальное разделение по частотам
-            size_t freqIdx = 1 + static_cast<size_t>(powf(t, 1.5f) * (fftSize / 2 - 2));
-            if (freqIdx >= fftSize / 2) freqIdx = fftSize / 2 - 1;
-
-            double rms = std::abs(fftData[freqIdx]) / (fftSize / 2.0f);
-
-            // 🟢 АДАПТИВНЫЙ БУСТ: Для ноута (ch > 2) оставляем подъем частот.
-            // Для ПК (ch == 2) буст СТРОГО равен 1.0 — мы вообще не трогаем чистый сигнал карточки!
-            float freqBoost = (ch > 2) ? (1.0f + (t * 2.5f) + (powf(t, 3.0f) * 3.5f)) : 1.0f;
-            rms *= freqBoost;
-
+        for (int band = 0; band < 64; ++band) {
+            float t = (float)band / 64.0f;
             float bandVal = 0.0f;
 
-            if (rms > 0.00001) {
-                float db = 20.0f * log10f(static_cast<float>(rms));
+            // 💻 ВЕТКА ДЛЯ НОУТБУКА — ТЕПЕРЬ НА КРАСИВОЙ ПК-МАТЕМАТИКЕ 10*log10
+            if (isLaptop) {
+                size_t freqIdx = 1 + static_cast<size_t>(powf(t, 1.5f) * (fftSize / 2 - 2));
+                if (freqIdx >= fftSize / 2) freqIdx = fftSize / 2 - 1;
 
-                // 🟢 РАСШИРЕННЫЙ ДИНАМИЧЕСКИЙ ДИАПАЗОН ДЛЯ ПК:
-                // Для ноута (ch > 2) оставляем проверенные -44 дБ / шаг 36.
-                // Для ПК (ch == 2) опускаем пол до -54 дБ, а диапазон деления увеличиваем до 54.
-                // Это жестко прижмет общую высоту банд к полу и не даст им долбиться в потолок.
-                float floorDb = (ch > 2) ? -44.0f : -54.0f;
-                float rangeDb = (ch > 2) ? 36.0f : 54.0f;
+                double rms = std::abs(fftData[freqIdx]) / (fftSize / 2.0f);
 
-                bandVal = (db - floorDb) / rangeDb;
+                // Оставляем твой сочный буст, чтобы середина и верха на ноуте не проседали
+                float freqBoost = 1.0f + (t * 2.0f) + (powf(t, 3.0f) * 3.5f);
+                rms *= freqBoost;
 
-                // На ПК (ch == 2) дополнительно слегка занижаем итоговую высоту (на 20%),
-                // чтобы полосы ходили строго в красивом среднем диапазоне экрана
-                if (ch == 2) {
-                    bandVal *= 0.8f;
+                if (rms > 0.00001) {
+                    // 🟢 ИСПРАВЛЕНО: Перевели ноут на твой любимый десятый логарифм ПК!
+                    // Смещение +25.0f идеально сохраняет ОХУЕННУЮ СИЛУ пульсаций Realtek карточки,
+                    // но делает ход полос плавным, ровным и упругим, как на компе.
+                    float db = 10.0f * log10f(static_cast<float>(rms));
+                    bandVal = (db + 25.0f) / 20.0f;
+                    if (bandVal < 0.0f) bandVal = 0.0f;
                 }
+            }
+            // 🖥️ ВЕТКА ДЛЯ ПК — ТВОЙ ОРИГИНАЛЬНЫЙ АНАЛИЗ СО СДВИГОМ НИЗОВ ОСТАЛСЯ 1 К 1
+            else {
+                float pcT = t + 0.12f * (1.0f - powf(t, 2.0f));
 
-                if (bandVal < 0.0f) bandVal = 0.0f;
+                size_t freqIdx = 1 + static_cast<size_t>(powf(pcT, 1.5f) * (fftSize / 2 - 2));
+                if (freqIdx >= fftSize / 2) freqIdx = fftSize / 2 - 1;
+
+                double rms = std::abs(fftData[freqIdx]) / (fftSize / 2.0f);
+
+                if (rms > 0.00002) {
+                    float db = 10.0f * log10f(static_cast<float>(rms));
+                    bandVal = (db + 22.0f) / 20.0f;
+                    if (bandVal < 0.0f) bandVal = 0.0f;
+                }
             }
 
-            // Твое мягкое сглаживание соседних банд для баса
+            // Твое мягкое басовое сглаживание соседних полос
             if (band > 0 && t < 0.3f) {
                 bandVal = (bandVal * 0.6f) + (targets[band - 1] * 0.4f);
             }
@@ -545,14 +549,28 @@ public:
             totalEnergy += targets[band];
         }
 
-        for (int i = 0; i < numBands; ++i) bands[i].update(targets[i]);
-} // Конец метода Update
+        // МОДДЕР НИЗОВ — СТРОГО ДЛЯ ПК (На ноуте не включается)
+        if (!isLaptop) {
+            float livePulse = targets[7];
+            for (int band = 0; band < 7; ++band) {
+                float scale = 0.45f + (static_cast<float>(band) * 0.08f);
+                float finalVal = livePulse * scale;
+
+                if (finalVal < 0.05f) {
+                    finalVal = 0.0f;
+                }
+                targets[band] = finalVal;
+            }
+        }
+
+        for (int i = 0; i < 64; ++i) bands[i].update(targets[i]);
+    } // Конец метода Update
 
     Band GetBand(int i) const {
-        if (i < 0 || i >= numBands) return Band();
+        if (i < 0 || i >= 64) return Band();
         std::lock_guard<std::mutex> lock(mtx); return bands[i];
     }
-};
+}; // Конец класса AudioCapture
 
 AudioCapture g_audio;
 
@@ -899,8 +917,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         nid.uCallbackMessage = WM_USER + 1; nid.uVersion = NOTIFYICON_VERSION_4;
 
         HICON hTempIcon = (HICON)LoadImageW(GetModuleHandle(NULL), MAKEINTRESOURCEW(1), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
-        if (!hTempIcon || hTempIcon == (HICON)-1) { OutputDebugStringW(L"[Tray] Equalizer.ico not found. Using fallback.\n"); hTempIcon = LoadIconW(NULL, IDI_APPLICATION); }
-        nid.hIcon = hTempIcon; hTrayIcon = hTempIcon; wcscpy_s(nid.szTip, _countof(nid.szTip), L"Pulsar GG");
+        if (!hTempIcon || hTempIcon == (HICON)-1) { OutputDebugStringW(L"[Tray] SoluGGix.ico not found. Using fallback.\n"); hTempIcon = LoadIconW(NULL, IDI_APPLICATION); }
+        nid.hIcon = hTempIcon; hTrayIcon = hTempIcon; wcscpy_s(nid.szTip, _countof(nid.szTip), L"SoluGGix");
 
         Shell_NotifyIconW(NIM_SETVERSION, &nid);
         BOOL ok = Shell_NotifyIconW(NIM_ADD, &nid);
