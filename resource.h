@@ -1,14 +1,17 @@
 //{{NO_DEPENDENCIES}}
-// Включаемый файл, созданный в Microsoft Visual C++.
-// Используется Resource.rc
+// пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅ, пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅ Microsoft Visual C++.
+// пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ Resource.rc
 //
 #define IDB_PNG1                        101
 #define IDB_PNG2                        102
 #define IDB_PNG3                        103
 #define IDB_PNG4                        104
 #define IDB_PNG5                        105
-#define ELVISH_FONT_ID                  106
-#define HOBBIT_FONT_ID                  107
+#define IDB_PNG6						106
+#define IDB_GIF1						107
+
+#define ELVISH_FONT_ID                  501
+#define HOBBIT_FONT_ID                  502
 
 // Next default values for new objects
 // 
