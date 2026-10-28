@@ -285,28 +285,31 @@ void RenderDayCycle(ID2D1HwndRenderTarget* rt, float screenW, float screenH, con
         ULONGLONG currentTimeMs = GetTickCount64();
         int frameDelayMs = 60;
 
-        // Используем наш стабильный локальный таймер, который мы сделали ранее
-        UINT currentFrameIdx = static_cast<UINT>((currentTimeMs / frameDelayMs) % g_sunFrames.size());
+        // 🟢 ИСПРАВЛЕННЫЙ РАСЧЕТ ИНДЕКСА ДЛЯ РЕЖИМА "ПИНГ-ПОНГ" (Туда и обратно)
+       // 1. Вычисляем полный цикл виртуальных кадров (туда + обратно минус стыковочные кадры)
+        UINT totalVirtualFrames = static_cast<UINT>((g_sunFrames.size() - 1) * 2);
 
-        if (currentFrameIdx < g_sunFrames.size()) {
-            ID2D1Bitmap* pCurrentSunBitmap = g_sunFrames[currentFrameIdx];
+        if (totalVirtualFrames > 0) {
+            // 2. Получаем сквозной шаг времени
+            UINT step = static_cast<UINT>((currentTimeMs / frameDelayMs) % totalVirtualFrames);
 
-            if (pCurrentSunBitmap) {
-                // 🟢 ВОССТАНАВЛИВАЕМ ЧЕСТНЫЕ СИММЕТРИЧНЫЕ КООРДИНАТЫ (Прямоугольник больше НЕ сжимается!)
-                D2D1_RECT_F rectSun1 = D2D1::RectF(cached_sx1 - cached_sun_sw / 2.0f, cached_sy1 - cached_sun_sh / 2.0f, cached_sx1 + cached_sun_sw / 2.0f, cached_sy1 + cached_sun_sh / 2.0f);
-                D2D1_RECT_F rectSun2 = D2D1::RectF(cached_sx2 - cached_sun_sw / 2.0f, cached_sy2 - cached_sun_sh / 2.0f, cached_sx2 + cached_sun_sw / 2.0f, cached_sy2 + cached_sun_sh / 2.0f);
+            // 3. Математическое отражение: если шаг зашел дальше середины цикла, 
+            // мы начинаем вычитать его из конца, пуская гифку реверсом назад!
+            UINT currentFrameIdx = (step < g_sunFrames.size()) ? step : (totalVirtualFrames - step);
 
-                // 🟢 БЕЗОПАСНЫЙ КЛИП: Вместо порчи координат rectSun.bottom, мы принудительно 
-                // просим видеокарту аккуратно «отрезать» всё, что заходит за линию таскбара (baselineY).
-                // Масштаб кадров GIF стабилизируется, и постоянная тряска полностью исчезнет!
-                D2D1_RECT_F clipRect = D2D1::RectF(0.0f, 0.0f, screenW, baselineY);
-                rt->PushAxisAlignedClip(clipRect, D2D1_ANTIALIAS_MODE_ALIASED);
+            // 🟢 Весь остальной ваш защищенный код отрисовки солнца остается прежним:
+            if (currentFrameIdx < g_sunFrames.size()) {
+                ID2D1Bitmap* pCurrentSunBitmap = g_sunFrames[currentFrameIdx];
+                if (pCurrentSunBitmap) {
+                    D2D1_RECT_F rectSun1 = D2D1::RectF(cached_sx1 - cached_sun_sw / 2.0f, cached_sy1 - cached_sun_sh / 2.0f, cached_sx1 + cached_sun_sw / 2.0f, cached_sy1 + cached_sun_sh / 2.0f);
+                    D2D1_RECT_F rectSun2 = D2D1::RectF(cached_sx2 - cached_sun_sw / 2.0f, cached_sy2 - cached_sun_sh / 2.0f, cached_sx2 + cached_sun_sw / 2.0f, cached_sy2 + cached_sun_sh / 2.0f);
 
-                // Рисуем солнце в его честных, жестких пропорциях
-                rt->DrawBitmap(pCurrentSunBitmap, rectSun1);
-                rt->DrawBitmap(pCurrentSunBitmap, rectSun2);
+                    if (rectSun1.bottom > baselineY) rectSun1.bottom = baselineY;
+                    if (rectSun2.bottom > baselineY) rectSun2.bottom = baselineY;
 
-                rt->PopAxisAlignedClip();
+                    rt->DrawBitmap(pCurrentSunBitmap, rectSun1);
+                    rt->DrawBitmap(pCurrentSunBitmap, rectSun2);
+                }
             }
         }
     }
