@@ -256,14 +256,14 @@ void RenderDayCycle(ID2D1HwndRenderTarget* rt, float screenW, float screenH, con
         float angleSun = 2.0f * PI_F * (tDayGlobal - 0.5f);
         float cosSun = cosf(angleSun); float sinSun = sinf(angleSun);
 
-        cached_sx1 = leftPivotX + R * sinSun; cached_sy1 = leftPivotY - R * cosSun;
-        cached_sx2 = rightPivotX + R * sinSun; cached_sy2 = rightPivotY - R * cosSun;
+        cached_sx1 = leftPivotX + R * sinSun; cached_sy1 = 0.0f - R * cosSun; // Считаем дельту от 0
+        cached_sx2 = rightPivotX + R * sinSun; cached_sy2 = 0.0f - R * cosSun;
 
         float angleMoon = 2.0f * PI_F * (tDayGlobal - (tDayGlobal > 0.5f ? 1.0f : 0.0f));
         float cosMoon = cosf(angleMoon); float sinMoon = sinf(angleMoon);
 
-        cached_mx1 = leftPivotX + R * sinMoon; cached_my1 = leftPivotY - R * cosMoon;
-        cached_mx2 = rightPivotX + R * sinMoon; cached_my2 = rightPivotY - R * cosMoon;
+        cached_mx1 = leftPivotX + R * sinMoon; cached_my1 = 0.0f - R * cosMoon; // Считаем дельту от 0
+        cached_mx2 = rightPivotX + R * sinMoon; cached_my2 = 0.0f - R * cosMoon;
 
         lastCachedMinute = st.wMinute;
     }
@@ -301,14 +301,23 @@ void RenderDayCycle(ID2D1HwndRenderTarget* rt, float screenW, float screenH, con
             if (currentFrameIdx < g_sunFrames.size()) {
                 ID2D1Bitmap* pCurrentSunBitmap = g_sunFrames[currentFrameIdx];
                 if (pCurrentSunBitmap) {
-                    D2D1_RECT_F rectSun1 = D2D1::RectF(cached_sx1 - cached_sun_sw / 2.0f, cached_sy1 - cached_sun_sh / 2.0f, cached_sx1 + cached_sun_sw / 2.0f, cached_sy1 + cached_sun_sh / 2.0f);
-                    D2D1_RECT_F rectSun2 = D2D1::RectF(cached_sx2 - cached_sun_sw / 2.0f, cached_sy2 - cached_sun_sh / 2.0f, cached_sx2 + cached_sun_sw / 2.0f, cached_sy2 + cached_sun_sh / 2.0f);
+                    // Мы принудительно прибавляем живой baselineY кадра к координатам Y
+                    D2D1_RECT_F rectSun1 = D2D1::RectF(
+                        cached_sx1 - cached_sun_sw / 2.0f,
+                        (baselineY + cached_sy1) - cached_sun_sh / 2.0f,
+                        cached_sx1 + cached_sun_sw / 2.0f,
+                        (baselineY + cached_sy1) + cached_sun_sh / 2.0f
+                    );
 
-                    if (rectSun1.bottom > baselineY) rectSun1.bottom = baselineY;
-                    if (rectSun2.bottom > baselineY) rectSun2.bottom = baselineY;
+                    D2D1_RECT_F rectSun2 = D2D1::RectF(
+                        cached_sx2 - cached_sun_sw / 2.0f,
+                        (baselineY + cached_sy2) - cached_sun_sh / 2.0f,
+                        cached_sx2 + cached_sun_sw / 2.0f,
+                        (baselineY + cached_sy2) + cached_sun_sh / 2.0f
+                    );
 
-                    rt->DrawBitmap(pCurrentSunBitmap, rectSun1);
-                    rt->DrawBitmap(pCurrentSunBitmap, rectSun2);
+                    rt->DrawBitmap(pCurrentSunBitmap, rectSun1, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
+                    rt->DrawBitmap(pCurrentSunBitmap, rectSun2, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
                 }
             }
         }
@@ -396,23 +405,20 @@ void RenderDayCycle(ID2D1HwndRenderTarget* rt, float screenW, float screenH, con
             // Плавное сжатие ширины
             float currentWidth = cached_moon_mw * scaleX;
 
-            // Координаты из вашего бэкапа
+            // Мы принудительно прибавляем живой baselineY кадра к координатам Y
             D2D1_RECT_F rectMoon1 = D2D1::RectF(
                 cached_mx1 - currentWidth / 2.0f,
-                cached_my1 - cached_moon_mh / 2.0f,
+                (baselineY + cached_my1) - cached_moon_mh / 2.0f,
                 cached_mx1 + currentWidth / 2.0f,
-                cached_my1 + cached_moon_mh / 2.0f
+                (baselineY + cached_my1) + cached_moon_mh / 2.0f
             );
 
             D2D1_RECT_F rectMoon2 = D2D1::RectF(
                 cached_mx2 - currentWidth / 2.0f,
-                cached_my2 - cached_moon_mh / 2.0f,
+                (baselineY + cached_my2) - cached_moon_mh / 2.0f,
                 cached_mx2 + currentWidth / 2.0f,
-                cached_my2 + cached_moon_mh / 2.0f
+                (baselineY + cached_my2) + cached_moon_mh / 2.0f
             );
-
-            if (rectMoon1.bottom > baselineY) rectMoon1.bottom = baselineY;
-            if (rectMoon2.bottom > baselineY) rectMoon2.bottom = baselineY;
 
             rt->DrawBitmap(pActiveMoon, rectMoon1);
             rt->DrawBitmap(pActiveMoon, rectMoon2);
@@ -422,6 +428,7 @@ void RenderDayCycle(ID2D1HwndRenderTarget* rt, float screenW, float screenH, con
         rt->PopAxisAlignedClip();
     }
 }
+
 void ShutdownDayCycle(DayCycleState& state) {
     if (state.bgLeft) { state.bgLeft->Release(); state.bgLeft = nullptr; }
     if (state.bgRight) { state.bgRight->Release(); state.bgRight = nullptr; }
