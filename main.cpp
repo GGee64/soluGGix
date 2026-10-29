@@ -1,10 +1,11 @@
-//soluGGix v1.2 (c) GGee64
+//soluGGix v1.3 (c) GGee64
 
 #define INITGUID
 #include <windows.h>
 #include <d2d1.h>
 #include "daycycle.h"
 #include "calendar.h"
+#include "stars.h"
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 #include <shellapi.h>
@@ -585,6 +586,7 @@ void DrawEqualizer(ID2D1HwndRenderTarget* rt, const OverlayState* state) {
     // ✅ ВЫЗОВ ЦИКЛА ДНЯ/НОЧИ (рисует фоны и светила до полос эквалайзера)
     RenderDayCycle(rt, screenWidth, screenHeight, state->dc);
     Cal::RenderCalendar(rt, (float)screenWidth, (float)screenHeight);
+    Stars::RenderStars(rt); // <-- Отрисовка летящих звезд
 
     Band data[64]; for (int e = 0; e < 64; ++e) data[e] = g_audio.GetBand(e);
     const int NUM_BANDS = 64;
@@ -741,9 +743,9 @@ LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_overlayActive.store(true);
         SetPropW(hwnd, L"OverlayState", reinterpret_cast<HANDLE>(state));
 
-        // ✅ ОПТИМИЗАЦИЯ №2: Жёсткий лимит 60 FPS для UI. 
+        // ✅ ОПТИМИЗАЦИЯ №2: Жёсткий лимит 75 FPS для UI. 
         // Привязка к герцовке монитора (144Hz+) на слоеных окнах вызывает переполнение буфера DWM и скачки GPU.
-        SetTimer(hwnd, 1, 16, NULL);
+        SetTimer(hwnd, 1, 13, NULL);
         SetTimer(hwnd, 2, 300, NULL); // Поддержание TOPMOST
 
         return 0;
@@ -841,31 +843,18 @@ bool WaitForValidAudio(AudioCapture* audio, std::chrono::milliseconds timeout) {
 void AnimationThread() {
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
     Cal::InitCalendarModule();
+    Stars::InitStarsModule(); // Инициализация звезд
     g_audio.Start();
     auto lastTime = std::chrono::steady_clock::now();
-    constexpr double targetDelta = 1000.0 / 75.0;
+    constexpr double targetDelta = 1000.0 / 75.0; // Логика на 75 Гц
     double accumulator = 0.0f;
 
     while (g_running) {
         bool needDeviceSwitch = g_deviceChanged.exchange(false);
-
         if (needDeviceSwitch || g_audio.streamInvalidated.exchange(false)) {
-            OutputDebugStringA("[Audio] Device switched / stream invalidated. Hot-reloading...\n");
-
-            // 1. Полная остановка и сброс состояния COM
             g_audio.Stop();
-            std::this_thread::sleep_for(std::chrono::milliseconds(50)); // Даем драйверу освободить аппаратные ресурсы
-
-            // 2. Безопасный рестрим с гарантией активации
-            if (g_audio.Start()) {
-                OutputDebugStringA("[Audio] Stream restarted successfully.\n");
-            }
-            else {
-                // Fallback если первый старт провалился (возможно, APM еще не маршрутизировал)
-                OutputDebugStringA("[Audio] First start failed. Retrying once...\n");
-                Sleep(100);
-                g_audio.Start();
-            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            g_audio.Start();
         }
 
         auto now = std::chrono::steady_clock::now();
@@ -873,14 +862,16 @@ void AnimationThread() {
         lastTime = now;
         accumulator += dt;
 
+        Stars::UpdateStarTimers(dt);
+
         while (accumulator >= targetDelta) {
             g_audio.Update();
-            if (hOverlayWnd && IsWindowVisible(hOverlayWnd)) InvalidateRect(hOverlayWnd, nullptr, FALSE);
+            Stars::UpdateStars(targetDelta); // Обновляем физику звезд с фиксированным шагом 75 Гц
             accumulator -= targetDelta;
         }
 
         std::unique_lock<std::mutex> lk(g_cv_m);
-        g_cv.wait_for(lk, std::chrono::milliseconds(50), [] { return !g_running; });
+        g_cv.wait_for(lk, std::chrono::milliseconds(10), [] { return !g_running; });
     }
 
     g_audio.Stop();
