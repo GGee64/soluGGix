@@ -12,6 +12,7 @@
 #pragma comment(lib, "Shlwapi.lib")
 
 extern HWND hOverlayWnd;
+extern HWND hMainWnd;
 
 std::vector<ID2D1Bitmap*> g_sunFrames;
 static ID2D1Bitmap* g_moonFlippedBitmap = nullptr;
@@ -168,11 +169,32 @@ HRESULT InitDayCycle(ID2D1HwndRenderTarget* rt, DayCycleState* state) {
 }
 
 void RenderDayCycle(ID2D1HwndRenderTarget* rt, float screenW, float screenH, const DayCycleState& state) {
-    // 🟢 ВОЗВРАЩАЕМ РОДНОЙ И СТАБИЛЬНЫЙ КЛИП ПАНЕЛИ ЗАДАЧ (Луна больше не залезет в трей)
     HWND hTaskbarWnd = ::FindWindowW(L"Shell_TrayWnd", NULL);
-    bool isClipPushed = false;
 
-    if (hTaskbarWnd && ::IsWindowVisible(hTaskbarWnd)) {
+    // --- НАДЕЖНЫЙ ДЕТЕКТОР ПОЛНОЭКРАННЫХ ПРИЛОЖЕНИЙ И ИГР ---
+    bool isFullscreenGameActive = false;
+    HWND hForegroundWnd = ::GetForegroundWindow();
+
+    if (hForegroundWnd && hForegroundWnd != ::GetDesktopWindow() && hForegroundWnd != ::GetShellWindow()) {
+        RECT rcApp;
+        if (::GetWindowRect(hForegroundWnd, &rcApp)) {
+            // Проверяем, занимает ли активное окно весь экран (или почти весь)
+            if (rcApp.left <= 0 && rcApp.top <= 0 &&
+                rcApp.right >= static_cast<long>(screenW) &&
+                rcApp.bottom >= static_cast<long>(screenH)) {
+
+                // Дополнительная проверка: оверлей не должен считать САМ СЕБЯ полноэкранной игрой
+                if (hForegroundWnd != hOverlayWnd && hForegroundWnd != hMainWnd) {
+                    isFullscreenGameActive = true;
+                }
+            }
+        }
+    }
+
+    // --- СТАБИЛЬНЫЙ КЛИП ПАНЕЛИ ЗАДАЧ ---
+    bool isClipPushed = false;
+    // Клипаем графику только если таскбар реально виден на рабочем столе (нет полноэкранной игры)
+    if (!isFullscreenGameActive && hTaskbarWnd && ::IsWindowVisible(hTaskbarWnd)) {
         RECT rectTaskbar;
         if (::GetWindowRect(hTaskbarWnd, &rectTaskbar)) {
             POINT pt = { rectTaskbar.left, rectTaskbar.top };
@@ -211,11 +233,20 @@ void RenderDayCycle(ID2D1HwndRenderTarget* rt, float screenW, float screenH, con
 
     SYSTEMTIME st; GetLocalTime(&st);
 
-    RECT workArea;
-    SystemParametersInfo(SPI_GETWORKAREA, 0, &workArea, 0);
-    int screenHeightPhysical = GetSystemMetrics(SM_CYSCREEN);
-    float taskbarHeight = static_cast<float>(screenHeightPhysical - workArea.bottom);
-    float baselineY = screenH - taskbarHeight;
+    // --- ДИНАМИЧЕСКИЙ РАСЧЕТ БАЗОВОЙ ЛИНИИ ---
+    float baselineY = screenH; // По умолчанию: самый низ экрана (если запущена игра)
+
+    // Считаем baselineY от таскбара только если полноэкранная игра НЕ активна
+    if (!isFullscreenGameActive && hTaskbarWnd && ::IsWindowVisible(hTaskbarWnd)) {
+        RECT rectTaskbar;
+        if (::GetWindowRect(hTaskbarWnd, &rectTaskbar)) {
+            POINT pt = { rectTaskbar.left, rectTaskbar.top };
+            ::ScreenToClient(hOverlayWnd, &pt);
+            if (pt.y > 0 && pt.y < screenH) {
+                baselineY = static_cast<float>(pt.y);
+            }
+        }
+    }
 
     rt->SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
     float textureScale = 0.35f;
@@ -239,69 +270,62 @@ void RenderDayCycle(ID2D1HwndRenderTarget* rt, float screenW, float screenH, con
     float R = fminf(250.0f, screenH * 0.15f);
     if (R < 30.0f) R = 30.0f;
 
-    // 🟢 ВОЗВРАЩАЕМ ВАШУ ОРИГИНАЛЬНУЮ МАТЕМАТИКУ (Поминутный расчет, никаких шлейфов!)
+    // --- СБРОС КЭША ПРИ ПЕРЕКЛЮЧЕНИИ РЕЖИМОВ ЭКРАНА ---
     static int lastCachedMinute = -1;
+    static bool lastFullscreenState = false; // Отслеживаем изменение режима экрана
     static float cached_sx1 = 0.0f, cached_sy1 = 0.0f;
     static float cached_sx2 = 0.0f, cached_sy2 = 0.0f;
     static float cached_mx1 = 0.0f, cached_my1 = 0.0f;
     static float cached_mx2 = 0.0f, cached_my2 = 0.0f;
 
-    if (st.wMinute != lastCachedMinute) {
+    if (st.wMinute != lastCachedMinute || isFullscreenGameActive != lastFullscreenState) {
         int secGlobal = st.wHour * 3600 + st.wMinute * 60;
         float tDayGlobal = static_cast<float>(secGlobal) / 86400.0f;
 
-        float leftPivotX = 0.0f; float leftPivotY = baselineY;
-        float rightPivotX = screenW; float rightPivotY = baselineY;
+        float leftPivotX = 0.0f;
+        float rightPivotX = screenW;
 
         float angleSun = 2.0f * PI_F * (tDayGlobal - 0.5f);
         float cosSun = cosf(angleSun); float sinSun = sinf(angleSun);
 
-        cached_sx1 = leftPivotX + R * sinSun; cached_sy1 = 0.0f - R * cosSun; // Считаем дельту от 0
+        cached_sx1 = leftPivotX + R * sinSun; cached_sy1 = 0.0f - R * cosSun;
         cached_sx2 = rightPivotX + R * sinSun; cached_sy2 = 0.0f - R * cosSun;
 
         float angleMoon = 2.0f * PI_F * (tDayGlobal - (tDayGlobal > 0.5f ? 1.0f : 0.0f));
         float cosMoon = cosf(angleMoon); float sinMoon = sinf(angleMoon);
 
-        cached_mx1 = leftPivotX + R * sinMoon; cached_my1 = 0.0f - R * cosMoon; // Считаем дельту от 0
+        cached_mx1 = leftPivotX + R * sinMoon; cached_my1 = 0.0f - R * cosMoon;
         cached_mx2 = rightPivotX + R * sinMoon; cached_my2 = 0.0f - R * cosMoon;
 
         lastCachedMinute = st.wMinute;
+        lastFullscreenState = isFullscreenGameActive;
     }
 
-    // 🟢 ВОЗВРАЩАЕМ ПРАВИЛЬНЫЙ РАСЧЕТ ПРОПОРЦИЙ ИЗ РАЗМЕРА ТЕКСТУРЫ
     if (!g_sunFrames.empty()) {
         D2D1_SIZE_F sunSize = g_sunFrames[0]->GetSize();
         cached_sun_sw = sunSize.width * 0.35f;
-            cached_sun_sh = sunSize.height * 0.35f;
+        cached_sun_sh = sunSize.height * 0.35f;
     }
     if (mutableState.moon) {
         D2D1_SIZE_F moonSize = mutableState.moon->GetSize();
         cached_moon_mw = moonSize.width * 0.35f;
         cached_moon_mh = moonSize.height * 0.35f;
     }
-    // ✅ ИСПРАВЛЕННЫЙ РОТАТОР КАДРОВ С ЛОКАЛЬНЫМ СТАБИЛЬНЫМ ТАЙМЕРОМ (0% ДРЕДАНИЯ КАДРОВ)
-    // ✅ ИСПРАВЛЕННЫЙ ВЫВОД: Аппаратный Clip панели задач без деформации текстуры
+
+    // Отрисовка анимированного солнца (Режим Пинг-Понг)
     if (!g_sunFrames.empty() && cached_sun_sw > 0.0f) {
         ULONGLONG currentTimeMs = GetTickCount64();
         int frameDelayMs = 60;
 
-        // 🟢 ИСПРАВЛЕННЫЙ РАСЧЕТ ИНДЕКСА ДЛЯ РЕЖИМА "ПИНГ-ПОНГ" (Туда и обратно)
-       // 1. Вычисляем полный цикл виртуальных кадров (туда + обратно минус стыковочные кадры)
         UINT totalVirtualFrames = static_cast<UINT>((g_sunFrames.size() - 1) * 2);
 
         if (totalVirtualFrames > 0) {
-            // 2. Получаем сквозной шаг времени
             UINT step = static_cast<UINT>((currentTimeMs / frameDelayMs) % totalVirtualFrames);
-
-            // 3. Математическое отражение: если шаг зашел дальше середины цикла, 
-            // мы начинаем вычитать его из конца, пуская гифку реверсом назад!
             UINT currentFrameIdx = (step < g_sunFrames.size()) ? step : (totalVirtualFrames - step);
 
-            // 🟢 Весь остальной ваш защищенный код отрисовки солнца остается прежним:
             if (currentFrameIdx < g_sunFrames.size()) {
                 ID2D1Bitmap* pCurrentSunBitmap = g_sunFrames[currentFrameIdx];
                 if (pCurrentSunBitmap) {
-                    // Мы принудительно прибавляем живой baselineY кадра к координатам Y
                     D2D1_RECT_F rectSun1 = D2D1::RectF(
                         cached_sx1 - cached_sun_sw / 2.0f,
                         (baselineY + cached_sy1) - cached_sun_sh / 2.0f,
@@ -322,108 +346,82 @@ void RenderDayCycle(ID2D1HwndRenderTarget* rt, float screenW, float screenH, con
             }
         }
     }
-    
-    //Отрисовка луны
-    // ✅ ФИНАЛЬНЫЙ ТАЙМЕР ЛУНЫ С РАНДОМОМ И 100 % ПЛАВНЫМ 3D - ФЛИПОМ
-        if (mutableState.moon && g_moonFlippedBitmap && cached_moon_mw > 0.0f) {
 
-            // Длительность самого процесса переворота (в секундах)
-            const float FLIP_DURATION_SEC = 1.2f;
-            // Время удержания перевернутой луны на экране (в секундах)
-            const float HOLD_DURATION_SEC = 10.0f;
-            // Полное время всей анимации (флип туда + удержание + флип обратно)
-            float totalAnimDuration = FLIP_DURATION_SEC * 2.0f + HOLD_DURATION_SEC;
+    // Отрисовка луны с рандомом и 3D-флипом
+    if (mutableState.moon && g_moonFlippedBitmap && cached_moon_mw > 0.0f) {
+        const float FLIP_DURATION_SEC = 1.2f;
+        const float HOLD_DURATION_SEC = 10.0f;
+        float totalAnimDuration = FLIP_DURATION_SEC * 2.0f + HOLD_DURATION_SEC;
 
-            // Статические переменные для защиты от рассинхронизации Windows
-            static bool isAnimating = false;
-            static ULONGLONG animStartTimeMs = 0;
-            static int lastCheckedMinute = -1;
+        static bool isAnimating = false;
+        static ULONGLONG animStartTimeMs = 0;
+        static int lastCheckedMoonMinute = -1;
+        static int nextIntervalMinutes = 5;
+        static int minutesPassedInState = 0;
 
-            // Случайный интервал: инициализируем при первом старте (например, 5 минут)
-            static int nextIntervalMinutes = 5;
-            static int minutesPassedInState = 0;
+        if (st.wMinute != lastCheckedMoonMinute) {
+            if (lastCheckedMoonMinute != -1) {
+                minutesPassedInState++;
 
-            // Каждую новую минуту проверяем прогресс таймера
-            if (st.wMinute != lastCheckedMinute) {
-                if (lastCheckedMinute != -1) {
-                    minutesPassedInState++;
+                if (minutesPassedInState >= nextIntervalMinutes && !isAnimating) {
+                    isAnimating = true;
+                    animStartTimeMs = GetTickCount64();
+                    minutesPassedInState = 0;
 
-                    // Если прошло случайное количество минут — взводим триггер анимации
-                    if (minutesPassedInState >= nextIntervalMinutes && !isAnimating) {
-                        isAnimating = true;
-                        animStartTimeMs = GetTickCount64();
-                        minutesPassedInState = 0;
-
-                        // 🟢 РАНДОМИЗАТОР: Сразу выбираем случайный следующий интервал от 5 до 15 минут
-                        // Используем системный GetTickCount64 в качестве сида для честного рандома
-                        srand(static_cast<unsigned int>(GetTickCount64()));
-                        nextIntervalMinutes = 5 + (rand() % 11); // Генерирует число от 5 до 15
-                    }
-                }
-                lastCheckedMinute = st.wMinute;
-            }
-
-            bool isFlippedPeriod = false;
-            float scaleX = 1.0f; // Коэффициент сжатия по ширине (1.0 = норма, 0.0 = ребро)
-
-            // Логика плавной отрисовки флипа по чистому локальному счетчику миллисекунд
-            if (isAnimating) {
-                ULONGLONG elapsedMs = GetTickCount64() - animStartTimeMs;
-                float currentSeconds = static_cast<float>(elapsedMs) / 1000.0f;
-
-                if (currentSeconds < totalAnimDuration) {
-                    // 1. ЭТАП: Переворот туда (Обычная луна схлопывается в 0, перевернутая разворачивается)
-                    if (currentSeconds < FLIP_DURATION_SEC) {
-                        float progress = currentSeconds / FLIP_DURATION_SEC;
-                        scaleX = fabsf(cosf(progress * PI_F));
-                        isFlippedPeriod = (progress > 0.5f);
-                    }
-                    // 2. ЭТАП: Удержание (Перевернутая луна стабильно висит на экране)
-                    else if (currentSeconds >= FLIP_DURATION_SEC && currentSeconds < (FLIP_DURATION_SEC + HOLD_DURATION_SEC)) {
-                        isFlippedPeriod = true;
-                        scaleX = 1.0f;
-                    }
-                    // 3. ЭТАП: Обратный переворот (Перевернутая схлопывается в 0, обычная возвращается)
-                    else if (currentSeconds >= (FLIP_DURATION_SEC + HOLD_DURATION_SEC) && currentSeconds < totalAnimDuration) {
-                        float timeInBackFlip = currentSeconds - (FLIP_DURATION_SEC + HOLD_DURATION_SEC);
-                        float progress = timeInBackFlip / FLIP_DURATION_SEC;
-                        scaleX = fabsf(cosf(progress * PI_F));
-                        isFlippedPeriod = (progress <= 0.5f);
-                    }
-                }
-                else {
-                    // Анимация полностью завершилась — сбрасываем флаги
-                    isAnimating = false;
-                    isFlippedPeriod = false;
-                    scaleX = 1.0f;
+                    srand(static_cast<unsigned int>(GetTickCount64()));
+                    nextIntervalMinutes = 5 + (rand() % 11);
                 }
             }
-
-            // Выбираем текстуру
-            ID2D1Bitmap* pActiveMoon = isFlippedPeriod ? g_moonFlippedBitmap : mutableState.moon;
-
-            // Плавное сжатие ширины
-            float currentWidth = cached_moon_mw * scaleX;
-
-            // Мы принудительно прибавляем живой baselineY кадра к координатам Y
-            D2D1_RECT_F rectMoon1 = D2D1::RectF(
-                cached_mx1 - currentWidth / 2.0f,
-                (baselineY + cached_my1) - cached_moon_mh / 2.0f,
-                cached_mx1 + currentWidth / 2.0f,
-                (baselineY + cached_my1) + cached_moon_mh / 2.0f
-            );
-
-            D2D1_RECT_F rectMoon2 = D2D1::RectF(
-                cached_mx2 - currentWidth / 2.0f,
-                (baselineY + cached_my2) - cached_moon_mh / 2.0f,
-                cached_mx2 + currentWidth / 2.0f,
-                (baselineY + cached_my2) + cached_moon_mh / 2.0f
-            );
-
-            rt->DrawBitmap(pActiveMoon, rectMoon1);
-            rt->DrawBitmap(pActiveMoon, rectMoon2);
+            lastCheckedMoonMinute = st.wMinute;
         }
 
+        bool isFlippedPeriod = false;
+        float scaleX = 1.0f;
+
+        if (isAnimating) {
+            ULONGLONG elapsedMs = GetTickCount64() - animStartTimeMs;
+            float currentSeconds = static_cast<float>(elapsedMs) / 1000.0f;
+
+            if (currentSeconds < totalAnimDuration) {
+                if (currentSeconds < FLIP_DURATION_SEC) {
+                    float progress = currentSeconds / FLIP_DURATION_SEC;
+                    scaleX = fabsf(cosf(progress * PI_F));
+                    isFlippedPeriod = (progress > 0.5f);
+                }
+                else if (currentSeconds >= FLIP_DURATION_SEC && currentSeconds < (FLIP_DURATION_SEC + HOLD_DURATION_SEC)) {
+                    isFlippedPeriod = true;
+                    scaleX = 1.0f;
+                }
+                else if (currentSeconds >= (FLIP_DURATION_SEC + HOLD_DURATION_SEC) && currentSeconds < totalAnimDuration) {
+                    float timeInBackFlip = currentSeconds - (FLIP_DURATION_SEC + HOLD_DURATION_SEC);
+                    float progress = timeInBackFlip / FLIP_DURATION_SEC;
+                    scaleX = fabsf(cosf(progress * PI_F));
+                    isFlippedPeriod = (progress <= 0.5f);
+                }
+            }
+            else {
+                    isAnimating = false;
+                isFlippedPeriod = false;
+                scaleX = 1.0f;
+            }
+        }
+        ID2D1Bitmap* pActiveMoon = isFlippedPeriod ? g_moonFlippedBitmap : mutableState.moon;
+        float currentWidth = cached_moon_mw * scaleX;
+        D2D1_RECT_F rectMoon1 = D2D1::RectF(
+            cached_mx1 - currentWidth / 2.0f,
+            (baselineY + cached_my1) - cached_moon_mh / 2.0f,
+            cached_mx1 + currentWidth / 2.0f,
+            (baselineY + cached_my1) + cached_moon_mh / 2.0f
+        );
+        D2D1_RECT_F rectMoon2 = D2D1::RectF(
+            cached_mx2 - currentWidth / 2.0f,
+            (baselineY + cached_my2) - cached_moon_mh / 2.0f,
+            cached_mx2 + currentWidth / 2.0f,
+            (baselineY + cached_my2) + cached_moon_mh / 2.0f
+        );
+        rt->DrawBitmap(pActiveMoon, rectMoon1);
+        rt->DrawBitmap(pActiveMoon, rectMoon2);
+    }
     if (isClipPushed) {
         rt->PopAxisAlignedClip();
     }
