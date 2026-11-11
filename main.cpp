@@ -397,6 +397,7 @@ public:
         HRESULT hr = pCaptureClient->GetBuffer(&pData, &numFrames, &flags, nullptr, nullptr);
 
         if (hr == AUDCLNT_E_DEVICE_INVALIDATED) {
+            audioHistory.clear();
             streamInvalidated.store(true);
             this->Stop();
             return;
@@ -406,6 +407,13 @@ public:
 
         if (numFrames == 0 || !pData) {
             pCaptureClient->ReleaseBuffer(0);
+            for (int i = 0; i < 64; ++i) bands[i].update(0.0f);
+            return;
+        }
+
+        if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
+            pCaptureClient->ReleaseBuffer(numFrames);
+            audioHistory.clear();
             for (int i = 0; i < 64; ++i) bands[i].update(0.0f);
             return;
         }
@@ -423,18 +431,8 @@ public:
         if (isInt16) isFloat = false;
 
         double maxInFrame = 0.0;
-        static int debugCounter = 0;
-        bool shouldLog = (debugCounter++ % 100 == 0);
-
-        if (shouldLog) {
-            char debugHead[256];
-            sprintf_s(debugHead, "[AudioDebug] Frame arrived: numFrames=%u, ch=%d, bits=%u, subTag=0x%04X\n",
-                numFrames, ch, pwfx->wBitsPerSample, subTag);
-            OutputDebugStringA(debugHead);
-        }
 
         if (isFloat) {
-            if (shouldLog) OutputDebugStringA("[AudioDebug] Processing branch: FLOAT\n");
             const float* fSamp = reinterpret_cast<const float*>(pData);
             for (UINT32 i = 0; i < numFrames; ++i) {
                 float sL = fSamp[i * ch + 0];
@@ -445,7 +443,6 @@ public:
             }
         }
         else if (isInt16) {
-            if (shouldLog) OutputDebugStringA("[AudioDebug] Processing branch: INT16\n");
             const int16_t* iSamp = reinterpret_cast<const int16_t*>(pData);
             for (UINT32 i = 0; i < numFrames; ++i) {
                 float sL = static_cast<float>(iSamp[i * ch + 0]) / 32768.0f;
@@ -456,21 +453,20 @@ public:
             }
         }
         else if (isInt32) {
-            if (shouldLog) OutputDebugStringA("[AudioDebug] Processing branch: INT32\n");
             const int32_t* iSamp = reinterpret_cast<const int32_t*>(pData);
+            const float* fCheck = reinterpret_cast<const float*>(pData);
             for (UINT32 i = 0; i < numFrames; ++i) {
-                float sL = static_cast<float>(iSamp[i * ch + 0]) / 2147483648.0f;
-                float sR = (ch > 1) ? static_cast<float>(iSamp[i * ch + 1]) / 2147483648.0f : sL;
+                float rawL = fCheck[i * ch + 0];
+                float rawR = (ch > 1) ? fCheck[i * ch + 1] : rawL;
+
+                // Отсекаем -0.0f и фоновый шум Windows при паузе/переключении наушников
+                float sL = (fabsf(rawL) < 0.0005f) ? 0.0f : (static_cast<float>(iSamp[i * ch + 0]) / 2147483648.0f);
+                float sR = (ch > 1) ? ((fabsf(rawR) < 0.0005f) ? 0.0f : (static_cast<float>(iSamp[i * ch + 1]) / 2147483648.0f)) : sL;
+
                 audioHistory.push_back((sL + sR) * 0.5f);
                 if (fabsf(sL) > maxInFrame) maxInFrame = fabsf(sL);
                 if (fabsf(sR) > maxInFrame) maxInFrame = fabsf(sR);
             }
-        }
-
-        if (shouldLog) {
-            char peakLog[256];
-            sprintf_s(peakLog, "[AudioDebug] Calculated maxInFrame: %f\n", maxInFrame);
-            OutputDebugStringA(peakLog);
         }
 
         pCaptureClient->ReleaseBuffer(numFrames);
@@ -497,35 +493,28 @@ public:
 
         FFT_Base(fftData, false);
 
-        const double SILENCE_FLOOR = 0.002;
-
         bool isLaptop = (pwfx->wBitsPerSample == 16 && subTag != 1 && subTag != 3);
 
         for (int band = 0; band < 64; ++band) {
             float t = (float)band / 64.0f;
             float bandVal = 0.0f;
 
-            // 💻 ВЕТКА ДЛЯ НОУТБУКА — ТЕПЕРЬ НА КРАСИВОЙ ПК-МАТЕМАТИКЕ 10*log10
+            // ВЕТКА ДЛЯ НОУТБУКА
             if (isLaptop) {
                 size_t freqIdx = 1 + static_cast<size_t>(powf(t, 1.5f) * (fftSize / 2 - 2));
                 if (freqIdx >= fftSize / 2) freqIdx = fftSize / 2 - 1;
 
                 double rms = std::abs(fftData[freqIdx]) / (fftSize / 2.0f);
-
-                // Оставляем твой сочный буст, чтобы середина и верха на ноуте не проседали
                 float freqBoost = 1.0f + (t * 2.0f) + (powf(t, 3.0f) * 3.5f);
                 rms *= freqBoost;
 
                 if (rms > 0.00001) {
-                    // 🟢 ИСПРАВЛЕНО: Перевели ноут на твой любимый десятый логарифм ПК!
-                    // Смещение +25.0f идеально сохраняет ОХУЕННУЮ СИЛУ пульсаций Realtek карточки,
-                    // но делает ход полос плавным, ровным и упругим, как на компе.
                     float db = 10.0f * log10f(static_cast<float>(rms));
                     bandVal = (db + 25.0f) / 20.0f;
                     if (bandVal < 0.0f) bandVal = 0.0f;
                 }
             }
-            // 🖥️ ВЕТКА ДЛЯ ПК — ТВОЙ ОРИГИНАЛЬНЫЙ АНАЛИЗ СО СДВИГОМ НИЗОВ ОСТАЛСЯ 1 К 1
+            // ВЕТКА ДЛЯ ПК
             else {
                 float pcT = t + 0.12f * (1.0f - powf(t, 2.0f));
 
@@ -541,7 +530,6 @@ public:
                 }
             }
 
-            // Твое мягкое басовое сглаживание соседних полос
             if (band > 0 && t < 0.3f) {
                 bandVal = (bandVal * 0.6f) + (targets[band - 1] * 0.4f);
             }
@@ -550,7 +538,7 @@ public:
             totalEnergy += targets[band];
         }
 
-        // МОДДЕР НИЗОВ — СТРОГО ДЛЯ ПК (На ноуте не включается)
+        // МОДДЕР НИЗОВ ДЛЯ ПК
         if (!isLaptop) {
             float livePulse = targets[7];
             for (int band = 0; band < 7; ++band) {
@@ -565,7 +553,7 @@ public:
         }
 
         for (int i = 0; i < 64; ++i) bands[i].update(targets[i]);
-    } // Конец метода Update
+    }
 
     Band GetBand(int i) const {
         if (i < 0 || i >= 64) return Band();
